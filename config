@@ -286,6 +286,7 @@ VOD_DEPS="$VOD_DEPS                                           \
           $ngx_addon_dir/vod/filters/dynamic_clip.h           \
           $ngx_addon_dir/vod/filters/filter.h                 \
           $ngx_addon_dir/vod/filters/gain_filter.h            \
+          $ngx_addon_dir/vod/filters/key_change_filter.h      \
           $ngx_addon_dir/vod/filters/mix_filter.h             \
           $ngx_addon_dir/vod/filters/rate_filter.h            \
           $ngx_addon_dir/vod/hds/hds_amf0_encoder.h           \
@@ -377,6 +378,7 @@ VOD_SRCS="$VOD_SRCS                                           \
           $ngx_addon_dir/vod/filters/dynamic_clip.c           \
           $ngx_addon_dir/vod/filters/filter.c                 \
           $ngx_addon_dir/vod/filters/gain_filter.c            \
+          $ngx_addon_dir/vod/filters/key_change_filter.c      \
           $ngx_addon_dir/vod/filters/mix_filter.c             \
           $ngx_addon_dir/vod/filters/rate_filter.c            \
           $ngx_addon_dir/vod/hds/hds_amf0_encoder.c           \

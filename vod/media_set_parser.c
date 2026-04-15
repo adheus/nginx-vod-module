@@ -4,6 +4,7 @@
 #include "filters/gain_filter.h"
 #include "filters/rate_filter.h"
 #include "filters/mix_filter.h"
+#include "filters/key_change_filter.h"
 #include "filters/concat_clip.h"
 #include "filters/dynamic_clip.h"
 #include "input/silence_generator.h"
@@ -113,6 +114,7 @@ static json_parser_union_type_def_t media_clip_union_params[] = {
 	{ vod_string("gainFilter"), gain_filter_parse },
 	{ vod_string("mixFilter"), mix_filter_parse },
 	{ vod_string("rateFilter"), rate_filter_parse },
+	{ vod_string("keyChangeFilter"), key_change_filter_parse },
 	{ vod_string("concat"), concat_clip_parse },
 	{ vod_string("dynamic"), dynamic_clip_parse },
 	{ vod_string("silence"), silence_generator_parse },
@@ -208,6 +210,7 @@ static parser_init_t parser_init_funcs[] = {
 	gain_filter_parser_init,
 	mix_filter_parser_init,
 	rate_filter_parser_init,
+	key_change_filter_parser_init,
 	concat_clip_parser_init,
 	dynamic_clip_parser_init,
 	NULL
