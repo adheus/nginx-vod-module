@@ -43,6 +43,7 @@ typedef struct {
 	uint64_t first_frame_time_offset;
 	uint64_t next_frame_time_offset;
 	int32_t clip_from_frame_offset;
+	uint64_t total_frames_duration;		// sum of all frame durations in this segment
 
 	// iframes simulation only
 	uint64_t segment_limit;
