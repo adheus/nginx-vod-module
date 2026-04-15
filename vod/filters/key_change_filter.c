@@ -190,7 +190,7 @@ key_change_filter_parse(
 			context,
 			&source->v.obj,
 			NULL,
-			result);
+			(media_clip_t**)result);
 	}
 
 	filter = vod_alloc(context->request_context->pool, sizeof(*filter) + sizeof(filter->base.sources[0]));
