@@ -231,6 +231,67 @@ MAPPINGS = {
         with_key(2, with_gain(0.3, stem("piano"))),
         with_key(2, with_gain(0.3, stem("other"))),
     )),
+
+    # ===================================================================
+    # Multi-track MP4 tests — video + all stems in one file
+    # Used to verify A/V sync and mixFilter from same-file sources.
+    # Track order: a1=guitars, a2=bass, a3=drums, a4=vocals, a5=piano, a6=other
+    # ===================================================================
+
+    # Individual tracks from multi-track MP4 — to verify track selection
+    "mt_a1": seq({"type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": "a1"}),
+    "mt_a2": seq({"type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": "a2"}),
+    "mt_a3": seq({"type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": "a3"}),
+    "mt_a4": seq({"type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": "a4"}),
+    "mt_a5": seq({"type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": "a5"}),
+    "mt_a6": seq({"type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": "a6"}),
+
+    # Audio-only mix from multi-track MP4 (no video, mixing tracks from same file)
+    "mt_audio_only": {
+        "sequences": [{
+            "clips": [{
+                "type": "mixFilter",
+                "sources": [
+                    {"type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": f"a{i}"}
+                    for i in range(1, 7)
+                ],
+            }],
+        }],
+    },
+
+    # Mix guitars (a1) + vocals (a4) — both with real audio content, so result
+    # should clearly sound like guitars+vocals, not just guitars.
+    "mt_guitars_plus_vocals": {
+        "sequences": [{
+            "clips": [{
+                "type": "mixFilter",
+                "sources": [
+                    {"type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": "a1"},
+                    {"type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": "a4"},
+                ],
+            }],
+        }],
+    },
+
+    # Video + audio mix from multi-track MP4
+    "mt_full": {
+        "sequences": [
+            {
+                "clips": [{
+                    "type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": "v1",
+                }],
+            },
+            {
+                "clips": [{
+                    "type": "mixFilter",
+                    "sources": [
+                        {"type": "source", "path": f"{MEDIA_DIR}/multitrack.mp4", "tracks": f"a{i}"}
+                        for i in range(1, 7)
+                    ],
+                }],
+            },
+        ],
+    },
 }
 
 

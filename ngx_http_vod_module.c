@@ -1549,9 +1549,33 @@ ngx_http_vod_init_parse_params_metadata(
 			&request_tracks_mask);
 	}
 
+	// When a source is wrapped inside a filter (e.g., mixFilter combining multiple
+	// tracks from the same multi-track MP4), the URL's request_tracks_mask represents
+	// the OUTPUT track selection, not the INPUT track selection. Intersecting it with
+	// the source's JSON "tracks": spec would incorrectly drop sources whose track
+	// indices don't overlap with the URL mask.
+	//
+	// Example: URL /seg-1-a1.ts has request_tracks_mask = 0x1 (bit 0).
+	// JSON mixFilter sources with "tracks": "a1" (0x1) and "tracks": "a4" (0x8).
+	// Without this fix, the a4 source gets masked to 0x0 and dropped, leaving only a1.
+	//
+	// Detection: a source is "in filter" when its parent clip exists and is not itself
+	// a source (i.e., it's a filter like mixFilter, gainFilter, keyChangeFilter, etc.).
+	bool_t source_in_filter = (cur_source->base.parent != NULL &&
+		!media_clip_is_source(cur_source->base.parent->type));
+
 	for (media_type = 0; media_type < MEDIA_TYPE_COUNT; media_type++)
 	{
-		vod_track_mask_and_bits(tracks_mask[media_type], cur_source->tracks_mask[media_type], request_tracks_mask[media_type]);
+		if (source_in_filter)
+		{
+			// Use the JSON tracks spec directly — the URL mask applies to output selection
+			vod_memcpy(tracks_mask[media_type], cur_source->tracks_mask[media_type],
+				sizeof(tracks_mask[media_type]));
+		}
+		else
+		{
+			vod_track_mask_and_bits(tracks_mask[media_type], cur_source->tracks_mask[media_type], request_tracks_mask[media_type]);
+		}
 	}
 	parse_params->required_tracks_mask = tracks_mask;
 	parse_params->langs_mask = ctx->submodule_context.request_params.langs_mask;
