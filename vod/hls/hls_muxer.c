@@ -437,35 +437,6 @@ hls_muxer_init_base(
 
 	state->first_clip_track = track;
 
-	// Audio/video PTS base alignment: when audio and video come from different
-	// source files, each has a different first_frame_time_offset (derived from
-	// clip_start_time + source-specific offset). Anchor audio streams to the
-	// video stream's base so that the proportional PTS mapping (in
-	// hls_muxer_start_frame) maps onto the correct video timeline.
-	{
-		hls_muxer_stream_state_t* video_stream = NULL;
-		for (cur_stream = state->first_stream; cur_stream < state->last_stream; cur_stream++)
-		{
-			if (cur_stream->media_type == MEDIA_TYPE_VIDEO)
-			{
-				video_stream = cur_stream;
-				break;
-			}
-		}
-
-		if (video_stream != NULL)
-		{
-			for (cur_stream = state->first_stream; cur_stream < state->last_stream; cur_stream++)
-			{
-				if (cur_stream->media_type == MEDIA_TYPE_AUDIO)
-				{
-					cur_stream->first_frame_time_offset = video_stream->first_frame_time_offset;
-					cur_stream->next_frame_time_offset = video_stream->first_frame_time_offset;
-				}
-			}
-		}
-	}
-
 	// init the id3 stream
 	rc = hls_muxer_init_id3_stream(state, conf, media_set, &init_streams_state);
 	if (rc != VOD_OK)
@@ -678,42 +649,9 @@ hls_muxer_start_frame(hls_muxer_state_t* state)
 	selected_stream->cur_frame++;
 	state->frames_source = selected_stream->cur_frame_part.frames_source;
 	state->frames_source_context = selected_stream->cur_frame_part.frames_source_context;
-
-	// Audio/video PTS sync: when audio and video come from different source
-	// files, their frame durations don't share a common base (e.g., 29.97fps
-	// video vs 44100Hz AAC audio). Accumulating each stream's PTS from its own
-	// frame durations causes ~1s drift per minute.
-	//
-	// Fix: for audio frames in a muxed segment with video, compute audio PTS
-	// by mapping audio progress proportionally onto the video's timeline.
-	// ratio = audio_elapsed / audio_total → mapped to video_start + ratio * video_total.
-	// total_frames_duration is precomputed during simulation for both streams.
 	cur_frame_time_offset = selected_stream->next_frame_time_offset;
 	cur_frame_dts = selected_stream->next_frame_time_offset;
 	selected_stream->next_frame_time_offset += state->cur_frame->duration;
-
-	if (selected_stream->media_type == MEDIA_TYPE_AUDIO)
-	{
-		hls_muxer_stream_state_t* vs;
-		for (vs = state->first_stream; vs < state->last_stream; vs++)
-		{
-			if (vs->media_type == MEDIA_TYPE_VIDEO &&
-				selected_stream->total_frames_duration > 0 &&
-				vs->total_frames_duration > 0)
-			{
-				// audio_elapsed is how far into the audio segment we are
-				uint64_t audio_elapsed = cur_frame_time_offset -
-					selected_stream->first_frame_time_offset;
-
-				// Map proportionally onto video timeline
-				cur_frame_time_offset = vs->first_frame_time_offset +
-					(audio_elapsed * vs->total_frames_duration) /
-					selected_stream->total_frames_duration;
-				cur_frame_dts = cur_frame_time_offset;
-				break;
-			}
-		}
-	}
 
 	// TODO: in the case of multi clip without discontinuity, the test below is not sufficient
 	state->last_stream_frame = selected_stream->cur_frame >= selected_stream->cur_frame_part.last_frame && 
@@ -1279,10 +1217,6 @@ hls_muxer_simulation_reset(hls_muxer_state_t* state)
 	{
 		for (cur_stream = state->first_stream; cur_stream < state->last_stream; cur_stream++)
 		{
-			// Save total frame duration before resetting (used for A/V PTS sync)
-			cur_stream->total_frames_duration = cur_stream->next_frame_time_offset -
-				cur_stream->first_frame_time_offset;
-
 			cur_stream->cur_frame_part = *cur_stream->first_frame_part;
 			cur_stream->cur_frame = cur_stream->cur_frame_part.first_frame;
 			cur_stream->source = get_frame_part_source_clip(cur_stream->cur_frame_part);
