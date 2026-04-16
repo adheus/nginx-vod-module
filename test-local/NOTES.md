@@ -77,13 +77,21 @@ The Dockerfile runs from the repo root, not `test-local/`. So:
 - `COPY test-local/nginx.conf` references the file relative to build context
 - Always run `docker build -f test-local/Dockerfile .` from the fork root
 
-### 8. FIXED: multi-track MP4 mixFilter vs URL track mask
+### 8. Known nginx-vod-module behavior: URL track mask defaults to `a1`
 
-**Previous bug (fixed in commit e45e559):** For non-master playlist URLs (e.g., `seg-1-a1.ts`), the URL track mask is `0x1` (bit 0 = track a1 only). This was being ANDed with each filter source's JSON `"tracks": "aN"` spec at `ngx_http_vod_module.c:1554`, causing sources with `"tracks": "a2"` or higher to be masked to `0x0` and dropped. Result: the mix would collapse to just the `a1` source.
+**THIS IS THE BIG ONE.** For non-master playlist URLs (e.g., `index-f1-v1-f2-a1.m3u8`), the default track mask is `0x1` (bit 0 = track a1 only). The URL pattern `-a1-v1` means "first track of each type."
 
-**Fix:** when a source is wrapped inside a filter (its parent clip is not itself a source), skip the intersection and use the JSON's `tracks_mask` directly. The URL's mask applies to the OUTPUT selection, not to filter sources.
+This gets ANDed with the JSON mapping's `"tracks": "aN"` at:
+```
+ngx_http_vod_module.c:1554  vod_track_mask_and_bits(tracks_mask[media_type], cur_source->tracks_mask[media_type], request_tracks_mask[media_type]);
+```
 
-**Regression test:** `/mapped/hls/mt_guitars_plus_vocals/master.m3u8` — download via ffmpeg, output must sound like both guitars and vocals mixed (RMS around -25 dB). If it sounds like just guitars (RMS -20 dB = a1 alone), the bug regressed.
+**Consequence:** When the JSON mapping's mixFilter has sources with `"tracks": "a2"`, `"a3"`, etc., they all get masked to 0 at segment-serving time. Only sources with `"tracks": "a1"` survive. The mix collapses to a single source (a1).
+
+**Workaround options:**
+- Use master playlist URL pattern (`master.m3u8`) — this uses `PARSE_FILE_NAME_MULTI_STREAMS_PER_TYPE` flag which defaults all bits to set
+- Generate URLs with `-a0` (all audio tracks) — but this isn't what nginx naturally emits
+- Fork fix: change `ngx_http_vod_parse_uri_file_name` in `ngx_http_vod_request_parse.c` so `default_tracks_mask` is always "all bits set" regardless of flag
 
 ### 9. Metadata cache can mask test results
 
