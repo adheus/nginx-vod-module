@@ -6,7 +6,19 @@
 #include <libavcodec/avcodec.h>
 
 // constants
-#define AUDIO_ENCODER_INPUT_SAMPLE_FORMAT (AV_SAMPLE_FMT_S16)
+// Modern FFmpeg (>= ~6.0) native AAC encoder declares only AV_SAMPLE_FMT_FLTP
+// in its codec->sample_fmts list. Using S16 here makes
+// audio_encoder_is_format_supported() return FALSE at startup and disables
+// audio encoding. The filter chain (see audio_filter_init_sink) uses this
+// macro for the buffersink sample_formats option, so libavfilter will
+// auto-insert a format conversion from whatever the decoder produced (the
+// AAC decoder already outputs FLTP, so this is usually a no-op). The
+// encoder itself does not touch AVFrame buffers directly; it forwards them
+// to avcodec_send_frame(), so no byte-width / planar-vs-packed arithmetic
+// needs adjusting in audio_encoder.c. AUDIO_ENCODER_BITS_PER_SAMPLE (16)
+// remains correct — that is the coded/output bits-per-sample written into
+// the MP4 stsd box, not the input sample width.
+#define AUDIO_ENCODER_INPUT_SAMPLE_FORMAT (AV_SAMPLE_FMT_FLTP)
 
 //typedefs
 
