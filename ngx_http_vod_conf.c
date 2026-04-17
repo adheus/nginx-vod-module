@@ -115,6 +115,14 @@ ngx_http_vod_create_loc_conf(ngx_conf_t *cf)
 	conf->drm_info_cache = NGX_CONF_UNSET_PTR;
 	conf->min_single_nalu_per_frame_segment = NGX_CONF_UNSET_UINT;
 
+	// stateful-audio: without these UNSET markers, ngx_conf_set_*_slot
+	// reads the pcalloc'd zero as "already set" and fails the directive
+	// as duplicate; and ngx_conf_merge_*_value leaves the field at 0
+	// (never applying the default). The str_slot / flag_slot paths tolerate
+	// zero/null as "unset" without extra init, so only max_size needs this.
+	conf->encoder_state_max_size = NGX_CONF_UNSET_SIZE;
+	conf->encoder_state_post_blocking = NGX_CONF_UNSET;
+
 #if (NGX_THREADS)
 	conf->open_file_thread_pool = NGX_CONF_UNSET_PTR;
 #endif // NGX_THREADS
