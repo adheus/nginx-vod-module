@@ -3685,9 +3685,31 @@ ngx_http_vod_run_generators(ngx_http_vod_ctx_t *ctx)
 // and compute the request URI "<location>/<key>".
 // Returns NGX_OK on success; sets ctx->audio_state_key to the key part and
 // returns the full URI via *out_uri (palloc'd from r->pool).
+//
+// Key schema: {media_set_digest}/{seq_index}/{state_end_seg_index}/{track_index}
+//
+// state_end_seg_index represents "the segment at whose end this state was
+// captured". A POST after encoding segment N stores under state_end_seg_index=N.
+// A GET *before* encoding segment N (i.e. we need the state that existed at
+// the end of segment N-1) uses state_end_seg_index=N-1.
+//
+// For seg 0 there's no predecessor, so the GET would use state_end_seg_index=-1
+// (UINT32_MAX) which the upstream will 404 on — exactly the expected cold-start
+// behaviour. The caller detects the 404 and falls through to a fresh encoder.
+//
+// `key_direction` selects which offset to apply:
+//   ENCODER_STATE_KEY_GET  → seg_index - 1  (what we need to restore)
+//   ENCODER_STATE_KEY_POST → seg_index      (what we just produced)
+//
+typedef enum {
+	ENCODER_STATE_KEY_GET  = 0,
+	ENCODER_STATE_KEY_POST = 1,
+} encoder_state_key_direction_t;
+
 static ngx_int_t
 ngx_http_vod_build_encoder_state_uri(
 	ngx_http_vod_ctx_t* ctx,
+	encoder_state_key_direction_t direction,
 	ngx_str_t* out_uri)
 {
 	ngx_http_request_t* r = ctx->submodule_context.r;
@@ -3700,10 +3722,25 @@ ngx_http_vod_build_encoder_state_uri(
 	u_char* uri_buf;
 	u_char* stable_end;
 	size_t stable_len;
-	uint32_t seg_index = ctx->submodule_context.request_params.segment_index;
+	uint32_t cur_seg_index = ctx->submodule_context.request_params.segment_index;
+	uint32_t state_end_seg_index;
 	uint32_t seq_index = 0;  // default: first sequence (mask=1)
 	uint32_t track_index = 0;
 	uint32_t sequences_mask = ctx->submodule_context.request_params.sequences_mask;
+
+	if (direction == ENCODER_STATE_KEY_GET)
+	{
+		// We want the state captured at the end of the previous segment.
+		// For cur_seg_index==0 there is none; intentionally wrap to
+		// UINT32_MAX so the GET 404s deterministically.
+		state_end_seg_index = (cur_seg_index == 0)
+			? (uint32_t)0xFFFFFFFFu
+			: (cur_seg_index - 1);
+	}
+	else
+	{
+		state_end_seg_index = cur_seg_index;
+	}
 
 	// pick lowest bit of sequences mask as sequence index
 	if (sequences_mask != 0)
@@ -3776,7 +3813,7 @@ ngx_http_vod_build_encoder_state_uri(
 	key_buf = ngx_palloc(r->pool, 64);
 	if (key_buf == NULL) return NGX_ERROR;
 	p = ngx_sprintf(key_buf, "%*s/%uD/%uD/%uD",
-		(size_t)16, digest_hex, seq_index, seg_index, track_index);
+		(size_t)16, digest_hex, seq_index, state_end_seg_index, track_index);
 	ctx->audio_state_key.data = key_buf;
 	ctx->audio_state_key.len = p - key_buf;
 
@@ -3862,7 +3899,8 @@ ngx_http_vod_encoder_state_get(ngx_http_vod_ctx_t* ctx)
 		return NGX_OK;
 	}
 
-	rc = ngx_http_vod_build_encoder_state_uri(ctx, &uri);
+	// GET = look up the state captured at the end of the PRIOR segment.
+	rc = ngx_http_vod_build_encoder_state_uri(ctx, ENCODER_STATE_KEY_GET, &uri);
 	if (rc != NGX_OK)
 	{
 		return rc;
@@ -3948,7 +3986,8 @@ ngx_http_vod_encoder_state_post(ngx_http_vod_ctx_t* ctx)
 		return NGX_OK;
 	}
 
-	rc = ngx_http_vod_build_encoder_state_uri(ctx, &uri);
+	// POST = store the state captured at the end of the CURRENT segment.
+	rc = ngx_http_vod_build_encoder_state_uri(ctx, ENCODER_STATE_KEY_POST, &uri);
 	if (rc != NGX_OK)
 	{
 		av_free(ctx->audio_state_out_blob);
