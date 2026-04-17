@@ -3698,6 +3698,8 @@ ngx_http_vod_build_encoder_state_uri(
 	u_char* p;
 	u_char* key_buf;
 	u_char* uri_buf;
+	u_char* stable_end;
+	size_t stable_len;
 	uint32_t seg_index = ctx->submodule_context.request_params.segment_index;
 	uint32_t seq_index = 0;  // default: first sequence (mask=1)
 	uint32_t track_index = 0;
@@ -3715,12 +3717,48 @@ ngx_http_vod_build_encoder_state_uri(
 		}
 	}
 
-	// media_set_id: md5 of the parsed request URI (stable across same URL,
-	// differs across distinct mappings). Keep low 8 bytes hex = 16 chars.
+	// media_set_id: md5 of the stable prefix of r->uri (the mapping/media-set
+	// part), NOT the full URI. Segment N's URI is e.g.
+	//     /mapped/hls/<mapping_key>/seg-<N>-a<track>.ts
+	// Hashing r->uri directly makes every segment produce a different digest,
+	// so segment N+1's GET never finds segment N's POSTed state → all GETs
+	// return 404 and every segment encoder starts cold (priming silence every
+	// segment). The mapping_key (or any path component that identifies the
+	// media set) is the same for all segments/tracks of the same stream.
+	//
+	// Strip everything from (and including) the final '/' — the leaf file name
+	// (seg-N-aX.ts / index.m3u8 / master.m3u8) varies per request; the rest is
+	// the stable media-set identifier. The seg_index and track_index are carried
+	// separately in the key schema so we don't need them baked into the digest.
+	stable_end = r->uri.data + r->uri.len;
+	while (stable_end > r->uri.data && *(stable_end - 1) != '/')
+	{
+		stable_end--;
+	}
+	// stable_end now points one past the trailing '/'; back up to include it
+	// in the hashed portion (keeps "/mapped/hls/foo/" distinct from
+	// "/mapped/hls/foobar" + extra path segments).
+	if (stable_end > r->uri.data)
+	{
+		stable_end--;
+	}
+	stable_len = stable_end - r->uri.data;
+	if (stable_len == 0)
+	{
+		// pathological — no '/' at all in URI. Fall back to full URI so we
+		// at least stay deterministic for this single pathological request.
+		stable_len = r->uri.len;
+	}
+
 	ngx_md5_init(&md5);
-	ngx_md5_update(&md5, r->uri.data, r->uri.len);
+	ngx_md5_update(&md5, r->uri.data, stable_len);
 	ngx_md5_final(digest, &md5);
 	p = ngx_hex_dump(digest_hex, digest, 8);  // 16 hex chars
+
+	ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+		"ngx_http_vod_build_encoder_state_uri: stable_prefix=\"%*s\" "
+		"(full_uri=%V) digest16=%*s",
+		stable_len, r->uri.data, &r->uri, (size_t)16, digest_hex);
 
 	// allocate key: "%16s/%uD/%uD/%uD" worst case ~50 bytes
 	key_buf = ngx_palloc(r->pool, 64);
