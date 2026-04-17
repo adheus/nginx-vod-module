@@ -747,6 +747,19 @@ audio_filter_alloc_state(
 		encoder_params.timescale = sink_link->time_base.den;
 		encoder_params.bitrate = output_track->media_info.bitrate;
 
+		// stateful-audio: thread the FFSA shuttle from request_context
+		encoder_params.state_in_data  = NULL;
+		encoder_params.state_in_size  = 0;
+		encoder_params.state_out_data = NULL;
+		encoder_params.state_out_size = NULL;
+		if (request_context->audio_encoder_state_shuttle != NULL)
+		{
+			encoder_params.state_in_data  = request_context->audio_encoder_state_shuttle->state_in_data;
+			encoder_params.state_in_size  = request_context->audio_encoder_state_shuttle->state_in_size;
+			encoder_params.state_out_data = request_context->audio_encoder_state_shuttle->state_out_data;
+			encoder_params.state_out_size = request_context->audio_encoder_state_shuttle->state_out_size;
+		}
+
 		rc = audio_encoder_init(
 			request_context,
 			&encoder_params,

@@ -79,6 +79,15 @@ struct ngx_http_vod_loc_conf_s {
 	ngx_flag_t force_continuous_timestamps;
 	ngx_flag_t force_sequence_index;
 
+	// stateful-audio: encoder state transfer over HTTP (FFSA blob shuttle)
+	// When set, audio_encoder will GET prior-segment state from
+	// <encoder_state_location>/<key> before open2, and POST snapshot to
+	// <encoder_state_location>/<key> after flush. Default-off: empty = no hook.
+	// Key format: "{media_set_id}/{sequence_index}/{segment_index}/{track_index}"
+	ngx_str_t encoder_state_location;
+	ngx_flag_t encoder_state_post_blocking;
+	size_t encoder_state_max_size;
+
 	time_t expires[EXPIRES_TYPE_COUNT];
 	time_t last_modified_time;
 	ngx_hash_t  last_modified_types;

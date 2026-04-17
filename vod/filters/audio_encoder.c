@@ -4,12 +4,25 @@
 // constants
 #define AUDIO_ENCODER_BITS_PER_SAMPLE (16)
 
+// stateful-audio: compile-time probe for encoder state API
+// (see stateful-aac-validation/impl/ffmpeg-patches/0003-public-api.patch)
+#if defined(LIBAVCODEC_VERSION_INT) && \
+    LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(62, 30, 100)
+#define VOD_HAVE_ENCODER_STATE_API 1
+#else
+#define VOD_HAVE_ENCODER_STATE_API 0
+#endif
+
 // typedefs
 typedef struct
 {
 	request_context_t* request_context;
 	vod_array_t* frames_array;
 	AVCodecContext *encoder;
+
+	// stateful-audio output capture (owned by caller once set)
+	u_char** state_out_data;
+	size_t*  state_out_size;
 } audio_encoder_state_t;
 
 // globals
@@ -128,6 +141,13 @@ audio_encoder_init(
 	encoder->bit_rate = params->bitrate;
 	encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;		// make the codec generate the extra data
 
+	// stateful-audio: if caller will restore prior state, opt into BITEXACT
+	// so suppresses the periodic LIBAVCODEC_IDENT filler. See FFSA §1 flags bit 1.
+	if (params->state_in_data != NULL && params->state_in_size > 0)
+	{
+		encoder->flags |= AV_CODEC_FLAG_BITEXACT;
+	}
+
 	avrc = avcodec_open2(encoder, encoder_codec, NULL);
 	if (avrc < 0)
 	{
@@ -139,6 +159,36 @@ audio_encoder_init(
 
 	state->request_context = request_context;
 	state->frames_array = frames_array;
+	state->state_out_data = params->state_out_data;
+	state->state_out_size = params->state_out_size;
+
+	// stateful-audio: restore prior segment state, if any
+	if (params->state_in_data != NULL && params->state_in_size > 0)
+	{
+#if VOD_HAVE_ENCODER_STATE_API
+		avrc = avcodec_set_encoder_state(encoder,
+			params->state_in_data, params->state_in_size);
+		if (avrc < 0)
+		{
+			// restore failed → log + continue with fresh encoder (priming
+			// artefact will return for THIS segment only). Correctness > opt.
+			vod_log_error(VOD_LOG_WARN, request_context->log, 0,
+				"audio_encoder_init: avcodec_set_encoder_state failed %d, "
+				"falling back to fresh encoder", avrc);
+		}
+		else
+		{
+			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+				"audio_encoder_init: restored encoder state (%uz bytes)",
+				params->state_in_size);
+		}
+#else
+		// FFmpeg build predates avcodec_set_encoder_state — noisy warn
+		// once per process would be better; for now log at debug level.
+		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+			"audio_encoder_init: state_in ignored (ffmpeg lacks state API)");
+#endif
+	}
 
 	*result = state;
 
@@ -306,6 +356,37 @@ audio_encoder_flush(
 	}
 
 	av_packet_free(&output_packet);
+
+	// stateful-audio: snapshot encoder state post-flush. Must be AFTER final
+	// avcodec_receive_packet returned AVERROR_EOF so the AFQ and planar
+	// sample buffers reflect end-of-segment state.
+	if (state->state_out_data != NULL && state->state_out_size != NULL)
+	{
+#if VOD_HAVE_ENCODER_STATE_API
+		uint8_t* blob = NULL;
+		size_t   blob_sz = 0;
+		int      grc = avcodec_get_encoder_state(state->encoder, &blob, &blob_sz);
+		if (grc == 0 && blob != NULL && blob_sz > 0)
+		{
+			*state->state_out_data = blob;
+			*state->state_out_size = blob_sz;
+			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
+				"audio_encoder_flush: captured encoder state (%uz bytes)",
+				blob_sz);
+		}
+		else
+		{
+			*state->state_out_data = NULL;
+			*state->state_out_size = 0;
+			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+				"audio_encoder_flush: avcodec_get_encoder_state failed %d", grc);
+		}
+#else
+		*state->state_out_data = NULL;
+		*state->state_out_size = 0;
+#endif
+	}
+
 	return VOD_OK;
 }
 

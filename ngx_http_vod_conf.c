@@ -275,6 +275,11 @@ ngx_http_vod_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 	ngx_conf_merge_str_value(conf->proxy_header.key, prev->proxy_header.key, "X-Kaltura-Proxy");
 	ngx_conf_merge_str_value(conf->proxy_header.value, prev->proxy_header.value, "dumpApiRequest");
 
+	// stateful-audio hook
+	ngx_conf_merge_str_value(conf->encoder_state_location, prev->encoder_state_location, "");
+	ngx_conf_merge_value(conf->encoder_state_post_blocking, prev->encoder_state_post_blocking, 0);
+	ngx_conf_merge_size_value(conf->encoder_state_max_size, prev->encoder_state_max_size, 65536);
+
 	ngx_conf_merge_value(conf->last_modified_time, prev->last_modified_time, -1);
 	if (ngx_http_merge_types(
 		cf,
@@ -1102,6 +1107,28 @@ ngx_command_t ngx_http_vod_commands[] = {
 	ngx_http_set_complex_value_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_vod_loc_conf_t, upstream_extra_args),
+	NULL },
+
+	// stateful-audio encoder state shuttle (FFSA blob over HTTP)
+	{ ngx_string("vod_encoder_state_location"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_conf_set_str_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, encoder_state_location),
+	NULL },
+
+	{ ngx_string("vod_encoder_state_post_blocking"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_conf_set_flag_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, encoder_state_post_blocking),
+	NULL },
+
+	{ ngx_string("vod_encoder_state_max_size"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_conf_set_size_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, encoder_state_max_size),
 	NULL },
 
 	// path request parameters - mapped mode only

@@ -9,6 +9,15 @@
 #define AUDIO_ENCODER_INPUT_SAMPLE_FORMAT (AV_SAMPLE_FMT_S16)
 
 //typedefs
+
+// Stateful-audio hook: opaque FFSA blob shuttle.
+// state_in: optional pointer to prior segment's serialised encoder state
+//           (consumed by avcodec_set_encoder_state after open2). NULL = first
+//           segment / upstream 404 / hook disabled.
+// state_out: on successful flush, audio_encoder will av_malloc() a fresh blob
+//           via avcodec_get_encoder_state and set *state_out_data / *state_out_size.
+//           Caller owns the buffer (must av_free it). NULL pointers disable
+//           capture.
 typedef struct
 {
 	uint64_t channel_layout;
@@ -16,6 +25,12 @@ typedef struct
 	uint32_t sample_rate;
 	uint32_t timescale;
 	uint32_t bitrate;
+
+	// stateful-audio hook (opt-in; all NULL/0 → pre-hook behavior)
+	const u_char* state_in_data;
+	size_t        state_in_size;
+	u_char**      state_out_data;
+	size_t*       state_out_size;
 } audio_encoder_params_t;
 
 // functions

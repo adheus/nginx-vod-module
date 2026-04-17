@@ -352,6 +352,17 @@ typedef struct {
 struct buffer_pool_s;
 typedef struct buffer_pool_s buffer_pool_t;
 
+// stateful-audio shuttle: opaque FFSA blob pointers carried alongside
+// request_context_t so audio_encoder_init/flush can consume/produce state
+// without cascading signature changes through audio_filter_alloc_state.
+// See vod/filters/audio_encoder.h for semantics. All NULL/0 = disabled.
+typedef struct {
+	const u_char* state_in_data;
+	size_t        state_in_size;
+	u_char**      state_out_data;    // set by encoder, av_malloc'd, caller-owned
+	size_t*       state_out_size;
+} vod_audio_encoder_state_shuttle_t;
+
 typedef struct {
 	vod_pool_t* pool;
 	vod_log_t *log;
@@ -361,6 +372,7 @@ typedef struct {
 #if (VOD_DEBUG)
 	time_t time;
 #endif
+	vod_audio_encoder_state_shuttle_t* audio_encoder_state_shuttle;
 } request_context_t;
 
 enum {
