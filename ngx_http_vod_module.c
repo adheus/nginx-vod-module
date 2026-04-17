@@ -3755,10 +3755,22 @@ ngx_http_vod_build_encoder_state_uri(
 	ngx_md5_final(digest, &md5);
 	p = ngx_hex_dump(digest_hex, digest, 8);  // 16 hex chars
 
-	ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-		"ngx_http_vod_build_encoder_state_uri: stable_prefix=\"%*s\" "
-		"(full_uri=%V) digest16=%*s",
-		stable_len, r->uri.data, &r->uri, (size_t)16, digest_hex);
+	{
+		// Diagnostic log: show that the digest is computed from the stable
+		// prefix, not from the full (per-segment) URI. Wrap the prefix in a
+		// temporary ngx_str_t so we can use the %V formatter (no width arg
+		// needed, keeps the argument count within ngx_log_debugN limits).
+		ngx_str_t stable_str;
+		ngx_str_t digest_str;
+		stable_str.data = r->uri.data;
+		stable_str.len = stable_len;
+		digest_str.data = digest_hex;
+		digest_str.len = 16;
+		ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+			"ngx_http_vod_build_encoder_state_uri: stable_prefix=\"%V\" "
+			"full_uri=\"%V\" digest=%V",
+			&stable_str, &r->uri, &digest_str);
+	}
 
 	// allocate key: "%16s/%uD/%uD/%uD" worst case ~50 bytes
 	key_buf = ngx_palloc(r->pool, 64);
