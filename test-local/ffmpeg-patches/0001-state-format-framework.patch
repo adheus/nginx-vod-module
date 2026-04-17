@@ -1,0 +1,480 @@
+diff --git a/libavcodec/state_format.c b/libavcodec/state_format.c
+new file mode 100644
+index 0000000..47d8181
+--- /dev/null
++++ b/libavcodec/state_format.c
+@@ -0,0 +1,273 @@
++/*
++ * FFSA — FFmpeg State Atoms binary format (v1.0)
++ *
++ * Self-contained writer and two-pass reader for the wire format used by
++ * avcodec_{get,set}_encoder_state and analogous filter/swresample hooks.
++ * Layout (from design/state-format.md):
++ *
++ *   [header 32 B][payload_length u32 BE][payload atoms ...][payload_crc32 u32 BE]
++ *
++ * All multi-byte scalars are big-endian. Floats and doubles are IEEE 754
++ * bit patterns packed big-endian; no NaN canonicalisation. Atoms are
++ * 4-byte aligned; padding bytes are zero on write and ignored on read.
++ * The CRC is CRC-32/ISO-HDLC (reflected poly 0xEDB88320, init/xorout
++ * 0xFFFFFFFF) computed over the payload only, so a reader can validate
++ * magic and component before committing to read payload_length bytes.
++ *
++ * The reader is two-pass by design: ff_ffsa_reader_validate() runs
++ * every integrity check (magic, sizes, TLV walk, CRC) before any caller
++ * writes into target state. On any error the target is left untouched.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <string.h>
++
++#include "libavutil/mem.h"
++#include "libavutil/error.h"
++#include "libavutil/crc.h"
++#include "libavutil/sha.h"
++
++#include "state_format.h"
++
++/* ------------------------------------------------------------------ CRC -- */
++
++uint32_t ff_ffsa_crc32(const uint8_t *buf, size_t len)
++{
++    /* AV_CRC_32_IEEE_LE uses the reflected poly 0xEDB88320. The standard
++     * CRC-32/ISO-HDLC adds an init/xorout of 0xFFFFFFFF. */
++    const AVCRC *t = av_crc_get_table(AV_CRC_32_IEEE_LE);
++    if (!t)
++        return 0;
++    return ~av_crc(t, 0xFFFFFFFFu, buf, len);
++}
++
++/* --------------------------------------------------------------- SHA-256 - */
++
++uint64_t ff_ffsa_sha256_prefix64(const uint8_t *buf, size_t len)
++{
++    struct AVSHA *ctx = av_sha_alloc();
++    uint8_t digest[32];
++    uint64_t out;
++    int i;
++
++    if (!ctx)
++        return 0;
++    av_sha_init(ctx, 256);
++    av_sha_update(ctx, buf, len);
++    av_sha_final(ctx, digest);
++    av_free(ctx);
++
++    out = 0;
++    for (i = 0; i < 8; i++)
++        out = (out << 8) | (uint64_t)digest[i];
++    return out;
++}
++
++/* ------------------------------------------------------------ writer ---- */
++
++static int writer_reserve(FFSAWriter *w, size_t extra)
++{
++    size_t need;
++    uint8_t *nb;
++    if (w->err)
++        return w->err;
++    need = w->size + extra;
++    if (need <= w->cap)
++        return 0;
++    /* grow geometrically */
++    while (w->cap < need)
++        w->cap = w->cap ? w->cap * 2 : 256;
++    nb = av_realloc(w->buf, w->cap);
++    if (!nb) {
++        w->err = AVERROR(ENOMEM);
++        return w->err;
++    }
++    w->buf = nb;
++    return 0;
++}
++
++int ff_ffsa_writer_begin(FFSAWriter *w,
++                         uint16_t component_id,
++                         uint16_t component_version,
++                         uint32_t libav_version,
++                         uint32_t build_hash,
++                         uint64_t config_hash,
++                         uint16_t flags)
++{
++    memset(w, 0, sizeof(*w));
++    if (writer_reserve(w, FFSA_HEADER_SIZE) < 0)
++        return w->err;
++    w->buf[0] = FFSA_MAGIC0;
++    w->buf[1] = FFSA_MAGIC1;
++    w->buf[2] = FFSA_MAGIC2;
++    w->buf[3] = FFSA_MAGIC3;
++    w->buf[4] = FFSA_FORMAT_MAJOR;
++    w->buf[5] = FFSA_FORMAT_MINOR;
++    ff_ffsa_wr_u16be(w->buf + 6,  flags);
++    ff_ffsa_wr_u16be(w->buf + 8,  component_id);
++    ff_ffsa_wr_u16be(w->buf + 10, component_version);
++    ff_ffsa_wr_u32be(w->buf + 12, libav_version);
++    ff_ffsa_wr_u32be(w->buf + 16, build_hash);
++    ff_ffsa_wr_u64be(w->buf + 20, config_hash);
++    /* atom_count / reserved / payload_length patched in finish() */
++    memset(w->buf + 28, 0, 8);
++    w->size = FFSA_HEADER_SIZE;
++    w->payload_start = FFSA_HEADER_SIZE;
++    w->atom_count = 0;
++    return 0;
++}
++
++int ff_ffsa_writer_add_atom(FFSAWriter *w,
++                            uint16_t type, uint16_t flags,
++                            const void *value, uint32_t length)
++{
++    uint32_t pad = (4 - (length & 3)) & 3;
++    if (w->err)
++        return w->err;
++    if (writer_reserve(w, (size_t)FFSA_ATOM_HEADER_SIZE + length + pad) < 0)
++        return w->err;
++    ff_ffsa_wr_u16be(w->buf + w->size, type);
++    ff_ffsa_wr_u16be(w->buf + w->size + 2, flags);
++    ff_ffsa_wr_u32be(w->buf + w->size + 4, length);
++    w->size += FFSA_ATOM_HEADER_SIZE;
++    if (length && value)
++        memcpy(w->buf + w->size, value, length);
++    w->size += length;
++    if (pad) {
++        memset(w->buf + w->size, 0, pad);
++        w->size += pad;
++    }
++    w->atom_count++;
++    return 0;
++}
++
++int ff_ffsa_writer_finish(FFSAWriter *w, uint8_t **out_buf, size_t *out_size)
++{
++    size_t payload_len;
++    uint32_t crc;
++    if (w->err)
++        return w->err;
++    payload_len = w->size - w->payload_start;
++    if (payload_len > 0xFFFFFFFFu) {
++        ff_ffsa_writer_abort(w);
++        return AVERROR(EINVAL);
++    }
++    /* atom_count @26, reserved @28, payload_length @30 in the 36-byte header.
++     * But the spec places payload_length at offset 32 and atom_count at 28.
++     * Re-reading: atom_count=28, reserved=30, payload_length=32. */
++    ff_ffsa_wr_u16be(w->buf + 28, (uint16_t)w->atom_count);
++    ff_ffsa_wr_u16be(w->buf + 30, 0);
++    ff_ffsa_wr_u32be(w->buf + 32, (uint32_t)payload_len);
++
++    if (writer_reserve(w, FFSA_TRAILER_SIZE) < 0)
++        return w->err;
++    crc = ff_ffsa_crc32(w->buf + w->payload_start, payload_len);
++    ff_ffsa_wr_u32be(w->buf + w->size, crc);
++    w->size += FFSA_TRAILER_SIZE;
++
++    *out_buf = w->buf;
++    *out_size = w->size;
++    /* ownership transferred */
++    w->buf = NULL;
++    w->size = w->cap = 0;
++    return 0;
++}
++
++void ff_ffsa_writer_abort(FFSAWriter *w)
++{
++    av_freep(&w->buf);
++    w->size = w->cap = 0;
++    w->err = 0;
++    w->atom_count = 0;
++}
++
++/* ------------------------------------------------------------ reader ---- */
++
++int ff_ffsa_reader_validate(FFSAReader *r, const uint8_t *buf, size_t size)
++{
++    size_t off;
++    uint32_t crc, stored;
++    int i;
++
++    memset(r, 0, sizeof(*r));
++
++    if (size < FFSA_HEADER_SIZE + FFSA_TRAILER_SIZE)
++        return AVERROR(EINVAL);
++    if (buf[0] != FFSA_MAGIC0 || buf[1] != FFSA_MAGIC1 ||
++        buf[2] != FFSA_MAGIC2 || buf[3] != FFSA_MAGIC3)
++        return AVERROR(EINVAL);
++
++    r->header.format_major      = buf[4];
++    r->header.format_minor      = buf[5];
++    r->header.flags             = ff_ffsa_rd_u16be(buf + 6);
++    r->header.component_id      = ff_ffsa_rd_u16be(buf + 8);
++    r->header.component_version = ff_ffsa_rd_u16be(buf + 10);
++    r->header.libav_version     = ff_ffsa_rd_u32be(buf + 12);
++    r->header.build_hash        = ff_ffsa_rd_u32be(buf + 16);
++    r->header.config_hash       = ff_ffsa_rd_u64be(buf + 20);
++    r->header.atom_count        = ff_ffsa_rd_u16be(buf + 28);
++    r->header.payload_length    = ff_ffsa_rd_u32be(buf + 32);
++
++    if (r->header.format_major != FFSA_FORMAT_MAJOR)
++        return AVERROR(EINVAL);
++
++    if ((size_t)FFSA_HEADER_SIZE + r->header.payload_length +
++        FFSA_TRAILER_SIZE != size)
++        return AVERROR(EINVAL);
++
++    r->buf = buf;
++    r->size = size;
++    r->payload = buf + FFSA_HEADER_SIZE;
++    r->payload_len = r->header.payload_length;
++
++    /* CRC */
++    stored = ff_ffsa_rd_u32be(buf + FFSA_HEADER_SIZE + r->payload_len);
++    crc = ff_ffsa_crc32(r->payload, r->payload_len);
++    if (crc != stored)
++        return AVERROR(EINVAL);
++
++    /* TLV walk — make sure every atom fits inside payload. */
++    off = 0;
++    for (i = 0; i < r->header.atom_count; i++) {
++        uint32_t len, pad;
++        if (off + FFSA_ATOM_HEADER_SIZE > r->payload_len)
++            return AVERROR(EINVAL);
++        len = ff_ffsa_rd_u32be(r->payload + off + 4);
++        pad = (4 - (len & 3)) & 3;
++        if (off + FFSA_ATOM_HEADER_SIZE + len + pad > r->payload_len)
++            return AVERROR(EINVAL);
++        if (off + FFSA_ATOM_HEADER_SIZE + len + pad < off) /* overflow guard */
++            return AVERROR(EINVAL);
++        off += FFSA_ATOM_HEADER_SIZE + len + pad;
++    }
++    /* trailing bytes inside payload after declared atoms are not allowed */
++    if (off != r->payload_len)
++        return AVERROR(EINVAL);
++
++    return 0;
++}
++
++int ff_ffsa_reader_find(const FFSAReader *r, uint16_t tag,
++                        const uint8_t **out_value, uint32_t *out_len)
++{
++    size_t off = 0;
++    int i;
++    for (i = 0; i < r->header.atom_count; i++) {
++        uint16_t t = ff_ffsa_rd_u16be(r->payload + off);
++        uint32_t len = ff_ffsa_rd_u32be(r->payload + off + 4);
++        uint32_t pad = (4 - (len & 3)) & 3;
++        if (t == tag) {
++            if (out_value) *out_value = r->payload + off + FFSA_ATOM_HEADER_SIZE;
++            if (out_len)   *out_len   = len;
++            return 1;
++        }
++        off += FFSA_ATOM_HEADER_SIZE + len + pad;
++    }
++    return 0;
++}
+diff --git a/libavcodec/state_format.h b/libavcodec/state_format.h
+new file mode 100644
+index 0000000..7b6184c
+--- /dev/null
++++ b/libavcodec/state_format.h
+@@ -0,0 +1,195 @@
++/*
++ * FFSA — FFmpeg State Atoms binary format (v1.0)
++ * Private helpers for encoder/filter state serialisation.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef AVCODEC_STATE_FORMAT_H
++#define AVCODEC_STATE_FORMAT_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++/* Magic and version */
++#define FFSA_MAGIC0 0x46 /* 'F' */
++#define FFSA_MAGIC1 0x46 /* 'F' */
++#define FFSA_MAGIC2 0x53 /* 'S' */
++#define FFSA_MAGIC3 0x41 /* 'A' */
++#define FFSA_FORMAT_MAJOR 0x01
++#define FFSA_FORMAT_MINOR 0x00
++
++/* Header flags */
++#define FFSA_FLAG_STRICT     (1u << 0)
++#define FFSA_FLAG_BITEXACT   (1u << 1)
++#define FFSA_FLAG_COMPRESSED (1u << 2)
++
++/* Atom flags */
++#define FFSA_ATOM_REQUIRED   (1u << 0)
++
++/* Component IDs */
++#define FFSA_COMPONENT_AAC_ENCODER 0x0001
++#define FFSA_COMPONENT_ARESAMPLE   0x0002
++#define FFSA_COMPONENT_AMIX        0x0003
++
++/* AAC encoder atom tags (component 0x0001) */
++#define FFSA_AAC_PLANAR_SAMPLES          0x0001
++#define FFSA_AAC_LAMBDA                  0x0002
++#define FFSA_AAC_RANDOM_STATE            0x0003
++#define FFSA_AAC_LAST_FRAME_PB_COUNT     0x0004
++#define FFSA_AAC_WINDOW_SEQUENCE         0x0005
++#define FFSA_AAC_USE_KB_WINDOW           0x0006
++#define FFSA_AAC_PSY_FILL_LEVEL          0x0007
++#define FFSA_AAC_PSY_PE                  0x0008
++#define FFSA_AAC_PSY_PREV_BAND           0x0009
++#define FFSA_AAC_PSY_WIN_ENERGY          0x000A
++#define FFSA_AAC_PSY_IIR_STATE           0x000B
++#define FFSA_AAC_PSY_NEXT_GROUPING       0x000C
++#define FFSA_AAC_PSY_NEXT_WINDOW_SEQ     0x000D
++#define FFSA_AAC_PSY_PREV_ENERGY_SUBSHORT 0x000E
++#define FFSA_AAC_PSY_PREV_ATTACK         0x000F
++#define FFSA_AAC_PSY_NEXT_ATTACK0_ZERO   0x0010
++#define FFSA_AAC_AFQ_HEADER              0x0011
++#define FFSA_AAC_AFQ_FRAMES              0x0012
++#define FFSA_AAC_FRAME_NUM               0x0013
++#define FFSA_AAC_PSY_CUTOFF              0x0014
++#define FFSA_AAC_PSY_COEF_MIN_SNR        0x0015
++
++/* Fixed sizes */
++#define FFSA_HEADER_SIZE 36
++#define FFSA_TRAILER_SIZE 4
++#define FFSA_ATOM_HEADER_SIZE 8
++
++/**
++ * Writer — appends to a growable buffer. All integers big-endian.
++ */
++typedef struct FFSAWriter {
++    uint8_t *buf;       /* av_malloc'd */
++    size_t   size;
++    size_t   cap;
++    int      err;       /* sticky error */
++    int      atom_count;
++    size_t   payload_start;
++} FFSAWriter;
++
++/**
++ * Begin a new blob. Writes the 36-byte header with placeholder
++ * atom_count / payload_length; finish() will patch them.
++ */
++int ff_ffsa_writer_begin(FFSAWriter *w,
++                         uint16_t component_id,
++                         uint16_t component_version,
++                         uint32_t libav_version,
++                         uint32_t build_hash,
++                         uint64_t config_hash,
++                         uint16_t flags);
++
++/* Append one atom. value may be NULL if length==0. */
++int ff_ffsa_writer_add_atom(FFSAWriter *w,
++                            uint16_t type, uint16_t flags,
++                            const void *value, uint32_t length);
++
++/* Finalise: patch atom_count/payload_length, append CRC.
++ * On success, sets out_buf and out_size; the caller owns out_buf (av_free). */
++int ff_ffsa_writer_finish(FFSAWriter *w, uint8_t **out_buf, size_t *out_size);
++
++/* Abort and release any buffer. */
++void ff_ffsa_writer_abort(FFSAWriter *w);
++
++/**
++ * Header metadata retrieved by a pass-1 parse.
++ */
++typedef struct FFSAHeader {
++    uint8_t  format_major;
++    uint8_t  format_minor;
++    uint16_t flags;
++    uint16_t component_id;
++    uint16_t component_version;
++    uint32_t libav_version;
++    uint32_t build_hash;
++    uint64_t config_hash;
++    uint16_t atom_count;
++    uint32_t payload_length;
++} FFSAHeader;
++
++/**
++ * Reader — two-pass. Pass 1: ff_ffsa_reader_validate() verifies the entire
++ * blob (magic, size, CRC, TLV walk) and returns a populated header. Pass 2:
++ * ff_ffsa_reader_find() lets the caller pull atoms by tag. The buffer must
++ * remain valid for the lifetime of the reader.
++ */
++typedef struct FFSAReader {
++    const uint8_t *buf;
++    size_t         size;
++    FFSAHeader     header;
++    const uint8_t *payload;  /* buf + FFSA_HEADER_SIZE */
++    size_t         payload_len;
++} FFSAReader;
++
++int ff_ffsa_reader_validate(FFSAReader *r, const uint8_t *buf, size_t size);
++
++/* Locate an atom by tag. Returns 1 if found (sets out_value and out_len),
++ * 0 if not found. Does not validate length against caller expectations. */
++int ff_ffsa_reader_find(const FFSAReader *r, uint16_t tag,
++                        const uint8_t **out_value, uint32_t *out_len);
++
++/* Big-endian scalar helpers — used by callers writing atom payloads. */
++static inline void ff_ffsa_wr_u16be(uint8_t *p, uint16_t v)
++{
++    p[0] = (uint8_t)(v >> 8);
++    p[1] = (uint8_t)(v);
++}
++static inline void ff_ffsa_wr_u32be(uint8_t *p, uint32_t v)
++{
++    p[0] = (uint8_t)(v >> 24);
++    p[1] = (uint8_t)(v >> 16);
++    p[2] = (uint8_t)(v >> 8);
++    p[3] = (uint8_t)(v);
++}
++static inline void ff_ffsa_wr_u64be(uint8_t *p, uint64_t v)
++{
++    ff_ffsa_wr_u32be(p, (uint32_t)(v >> 32));
++    ff_ffsa_wr_u32be(p + 4, (uint32_t)v);
++}
++static inline uint16_t ff_ffsa_rd_u16be(const uint8_t *p)
++{
++    return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
++}
++static inline uint32_t ff_ffsa_rd_u32be(const uint8_t *p)
++{
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++           ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
++}
++static inline uint64_t ff_ffsa_rd_u64be(const uint8_t *p)
++{
++    return ((uint64_t)ff_ffsa_rd_u32be(p) << 32) |
++           (uint64_t)ff_ffsa_rd_u32be(p + 4);
++}
++
++/* IEEE 754 bit-pattern helpers. No NaN canonicalisation. */
++static inline void ff_ffsa_wr_f32be(uint8_t *p, float v)
++{
++    union { float f; uint32_t u; } x;
++    x.f = v;
++    ff_ffsa_wr_u32be(p, x.u);
++}
++static inline float ff_ffsa_rd_f32be(const uint8_t *p)
++{
++    union { float f; uint32_t u; } x;
++    x.u = ff_ffsa_rd_u32be(p);
++    return x.f;
++}
++
++/* Compute CRC-32/ISO-HDLC (init/xorout 0xFFFFFFFF, reflected). */
++uint32_t ff_ffsa_crc32(const uint8_t *buf, size_t len);
++
++/* Compute SHA-256[0..7] of a preimage, returned as u64 host-order
++ * (to be written BE on the wire with ff_ffsa_wr_u64be). */
++uint64_t ff_ffsa_sha256_prefix64(const uint8_t *buf, size_t len);
++
++#endif /* AVCODEC_STATE_FORMAT_H */

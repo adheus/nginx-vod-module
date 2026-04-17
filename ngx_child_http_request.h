@@ -16,6 +16,15 @@ typedef struct {
 	ngx_table_elt_t extra_header;
 	ngx_flag_t proxy_range;
 	ngx_flag_t proxy_all_headers;
+
+	// optional request body for methods that carry one (e.g. POST/PUT).
+	// NULL (default) preserves the pre-existing no-body behavior. When
+	// non-NULL, the chain is attached to the subrequest's request_body
+	// and Content-Length/Content-Type headers are synthesized so the
+	// upstream proxy module forwards the bytes to the backend.
+	ngx_chain_t* body;
+	off_t body_length;
+	ngx_str_t body_content_type;
 } ngx_child_request_params_t;
 
 // functions

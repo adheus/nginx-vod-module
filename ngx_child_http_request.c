@@ -46,11 +46,28 @@ typedef struct {
 
 // constants
 static ngx_str_t ngx_http_vod_head_method = { 4, (u_char *) "HEAD " };
+static ngx_str_t ngx_http_vod_post_method = { 4, (u_char *) "POST " };
 
 static ngx_str_t range_key = ngx_string("Range");
 static u_char* range_lowcase_key = (u_char*)"range";
 static ngx_uint_t range_hash =
 	ngx_hash(ngx_hash(ngx_hash(ngx_hash('r', 'a'), 'n'), 'g'), 'e');
+
+static ngx_str_t content_length_key = ngx_string("Content-Length");
+static u_char* content_length_lowcase_key = (u_char*)"content-length";
+static ngx_uint_t content_length_hash =
+	ngx_hash(ngx_hash(ngx_hash(ngx_hash(ngx_hash(ngx_hash(ngx_hash(
+	ngx_hash(ngx_hash(ngx_hash(ngx_hash(ngx_hash(ngx_hash('c', 'o'),
+	'n'), 't'), 'e'), 'n'), 't'), '-'), 'l'), 'e'), 'n'), 'g'), 't'), 'h');
+
+static ngx_str_t content_type_key = ngx_string("Content-Type");
+static u_char* content_type_lowcase_key = (u_char*)"content-type";
+static ngx_uint_t content_type_hash =
+	ngx_hash(ngx_hash(ngx_hash(ngx_hash(ngx_hash(ngx_hash(ngx_hash(
+	ngx_hash(ngx_hash(ngx_hash(ngx_hash('c', 'o'), 'n'), 't'), 'e'),
+	'n'), 't'), '-'), 't'), 'y'), 'p'), 'e');
+
+static ngx_str_t default_body_content_type = ngx_string("application/octet-stream");
 
 static ngx_child_request_hide_header_t hide_headers[] = {
 	{ ngx_string("Accept"), 
@@ -417,7 +434,11 @@ ngx_child_request_copy_headers(
 	}
 
 	// allocate dest array
-	rc = ngx_list_init(&dest->headers, r->pool, count + 2, sizeof(ngx_table_elt_t));
+	//   +2 for extra_header + range; +2 more when body is attached
+	//   (Content-Length + Content-Type)
+	rc = ngx_list_init(&dest->headers, r->pool,
+		count + 2 + (params->body != NULL ? 2 : 0),
+		sizeof(ngx_table_elt_t));
 	if (rc != NGX_OK)
 	{
 		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -463,6 +484,29 @@ ngx_child_request_copy_headers(
 		{
 			dest->range = NULL;
 			continue;
+		}
+
+		// when we're attaching our own body, drop any inherited
+		// Content-Length / Content-Type from the parent request; they'd
+		// describe the parent's body, not ours.
+		if (params->body != NULL)
+		{
+			if (ch->hash == content_length_hash &&
+				ch->key.len == content_length_key.len &&
+				ngx_memcmp(ch->lowcase_key, content_length_lowcase_key,
+					content_length_key.len) == 0)
+			{
+				dest->content_length = NULL;
+				continue;
+			}
+			if (ch->hash == content_type_hash &&
+				ch->key.len == content_type_key.len &&
+				ngx_memcmp(ch->lowcase_key, content_type_lowcase_key,
+					content_type_key.len) == 0)
+			{
+				dest->content_type = NULL;
+				continue;
+			}
 		}
 
 		
@@ -557,6 +601,47 @@ ngx_child_request_copy_headers(
 			params->range_start,
 			params->range_end - 1) - h->value.data;
 		h->value.data[h->value.len] = '\0';
+	}
+
+	// add Content-Length / Content-Type when a body is attached
+	if (params->body != NULL)
+	{
+		ngx_str_t ct;
+
+		// Content-Length
+		h = output++;
+		h->hash = content_length_hash;
+#if defined(nginx_version) && nginx_version >= 1023000
+		h->next = NULL;
+#endif
+		h->key = content_length_key;
+		h->lowcase_key = content_length_lowcase_key;
+		h->value.data = ngx_pnalloc(r->pool, NGX_OFF_T_LEN + 1);
+		if (h->value.data == NULL)
+		{
+			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+				"ngx_child_request_copy_headers: ngx_pnalloc failed (cl)");
+			return NGX_ERROR;
+		}
+		h->value.len = ngx_sprintf(h->value.data, "%O", params->body_length)
+			- h->value.data;
+		h->value.data[h->value.len] = '\0';
+		dest->content_length = h;
+		dest->content_length_n = params->body_length;
+
+		// Content-Type
+		ct = params->body_content_type.len > 0
+			? params->body_content_type
+			: default_body_content_type;
+		h = output++;
+		h->hash = content_type_hash;
+#if defined(nginx_version) && nginx_version >= 1023000
+		h->next = NULL;
+#endif
+		h->key = content_type_key;
+		h->lowcase_key = content_type_lowcase_key;
+		h->value = ct;
+		dest->content_type = h;
 	}
 
 	// update the element count
@@ -676,7 +761,31 @@ ngx_child_request_start(
 		sr->method = NGX_HTTP_HEAD;
 		sr->method_name = ngx_http_vod_head_method;
 	}
-	
+	else if (params->method == NGX_HTTP_POST)
+	{
+		sr->method = NGX_HTTP_POST;
+		sr->method_name = ngx_http_vod_post_method;
+	}
+
+	// attach body (if any) before building headers so copy_headers
+	// synthesizes Content-Length with the right value. The body chain is
+	// wrapped in a fresh ngx_http_request_body_t that replaces the one
+	// inherited from the parent request by ngx_http_subrequest.
+	if (params->body != NULL)
+	{
+		ngx_http_request_body_t *rb = ngx_pcalloc(r->pool,
+			sizeof(ngx_http_request_body_t));
+		if (rb == NULL)
+		{
+			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+				"ngx_child_request_start: ngx_pcalloc failed (rb)");
+			return NGX_ERROR;
+		}
+		rb->bufs = params->body;
+		sr->request_body = rb;
+		sr->headers_in.content_length_n = params->body_length;
+	}
+
 	// build the request headers
 	rc = ngx_child_request_copy_headers(r, params, &sr->headers_in, &r->headers_in);
 	if (rc != NGX_OK)

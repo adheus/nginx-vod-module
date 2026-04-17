@@ -1,0 +1,209 @@
+diff --git a/doc/APIchanges b/doc/APIchanges
+index c57321c..9f2b4fc 100644
+--- a/doc/APIchanges
++++ b/doc/APIchanges
+@@ -2,6 +2,22 @@ The last version increases of all libraries were on 2025-03-28
+ 
+ API changes, most recent first:
+ 
++2026-04-16 - xxxxxxxxxx - lavfi 11.16.100 - avfilter.h
++  Add avfilter_get_filter_state() and avfilter_set_filter_state() for
++  snapshotting and restoring opened-filter internal state across
++  instances. Currently implemented for "amix"; other filters return
++  AVERROR(ENOSYS).
++
++2026-04-16 - xxxxxxxxxx - lswr 6.5.100 - swresample.h
++  Add swr_get_state() and swr_set_state() for snapshotting and
++  restoring an initialised SwrContext across instances (covers
++  aresample wrapper use cases).
++
++2026-04-16 - xxxxxxxxxx - lavc 62.30.100 - avcodec.h
++  Add avcodec_get_encoder_state() and avcodec_set_encoder_state() for
++  snapshotting and restoring opened-encoder internal state across
++  instances (native AAC encoder; other codecs return AVERROR(ENOSYS)).
++
+ 2026-04-09 - 6ba6db4f19 - lavu 60.30.100 - hdr_dynamic_metadata.h frame.h
+   Add AVDynamicHDRSmpte2094App5 struct and functions.
+   Add AV_FRAME_DATA_DYNAMIC_HDR_SMPTE_2094_APP5 side data type.
+diff --git a/libavfilter/avfilter.c b/libavfilter/avfilter.c
+index bb0b665..4cf7892 100644
+--- a/libavfilter/avfilter.c
++++ b/libavfilter/avfilter.c
+@@ -19,6 +19,8 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include "config_components.h"
++
+ #include "libavutil/avassert.h"
+ #include "libavutil/avstring.h"
+ #include "libavutil/bprint.h"
+@@ -44,6 +46,10 @@
+ #include "framepool.h"
+ #include "video.h"
+ 
++#if CONFIG_AMIX_FILTER
++#include "af_amix_state.h"
++#endif
++
+ static void tlog_ref(void *ctx, AVFrame *ref, int end)
+ {
+ #ifdef TRACE
+@@ -1003,6 +1009,40 @@ AVBufferRef *avfilter_link_get_hw_frames_ctx(AVFilterLink *link)
+     return NULL;
+ }
+ 
++/* ------------------------------------------- filter state snapshot API -- */
++
++int avfilter_get_filter_state(AVFilterContext *ctx,
++                              uint8_t **buf, size_t *size)
++{
++    if (!ctx || !buf || !size)
++        return AVERROR(EINVAL);
++    *buf = NULL;
++    *size = 0;
++    if (!ctx->filter || !ctx->filter->name)
++        return AVERROR(EINVAL);
++
++#if CONFIG_AMIX_FILTER
++    if (!strcmp(ctx->filter->name, "amix"))
++        return ff_amix_get_state(ctx, buf, size);
++#endif
++    return AVERROR(ENOSYS);
++}
++
++int avfilter_set_filter_state(AVFilterContext *ctx,
++                              const uint8_t *buf, size_t size)
++{
++    if (!ctx || !buf || !size)
++        return AVERROR(EINVAL);
++    if (!ctx->filter || !ctx->filter->name)
++        return AVERROR(EINVAL);
++
++#if CONFIG_AMIX_FILTER
++    if (!strcmp(ctx->filter->name, "amix"))
++        return ff_amix_set_state(ctx, buf, size);
++#endif
++    return AVERROR(ENOSYS);
++}
++
+ static int default_filter_frame(AVFilterLink *link, AVFrame *frame)
+ {
+     return ff_filter_frame(link->dst->outputs[0], frame);
+diff --git a/libavfilter/avfilter.h b/libavfilter/avfilter.h
+index 02b58c4..ba1808f 100644
+--- a/libavfilter/avfilter.h
++++ b/libavfilter/avfilter.h
+@@ -557,6 +557,40 @@ int avfilter_insert_filter(AVFilterLink *link, AVFilterContext *filt,
+  */
+ const AVClass *avfilter_get_class(void);
+ 
++/**
++ * Serialise the internal state of a filter into an opaque byte buffer.
++ *
++ * Intended for resuming a streaming filter in a fresh filter instance with
++ * bit-exact continuity. The wire format is stable within a single
++ * libavfilter (major,minor,micro) release — see state_format.c (FFSA v1).
++ *
++ * On success *buf is set to a freshly av_malloc()ed buffer that the caller
++ * owns and must release with av_free(), and *size is set to its length.
++ * On failure *buf is NULL and *size is 0.
++ *
++ * Currently supported filters: "amix". All other filters return
++ * AVERROR(ENOSYS).
++ *
++ * @return 0 on success, a negative AVERROR on failure.
++ */
++int avfilter_get_filter_state(AVFilterContext *ctx,
++                              uint8_t **buf, size_t *size);
++
++/**
++ * Restore previously-serialised filter state into a freshly-configured
++ * filter. Must be called after the filter's output link has been
++ * configured (config_output). The configuration fingerprint inside the
++ * blob must match the target filter's; otherwise AVERROR(EINVAL) is
++ * returned and the target is left untouched.
++ *
++ * Currently supported filters: "amix". Other filters return
++ * AVERROR(ENOSYS).
++ *
++ * @return 0 on success, a negative AVERROR on failure.
++ */
++int avfilter_set_filter_state(AVFilterContext *ctx,
++                              const uint8_t *buf, size_t size);
++
+ /**
+  * A function pointer passed to the @ref AVFilterGraph.execute callback to be
+  * executed multiple times, possibly in parallel.
+diff --git a/libavfilter/version.h b/libavfilter/version.h
+index 4afd496..d243558 100644
+--- a/libavfilter/version.h
++++ b/libavfilter/version.h
+@@ -31,8 +31,8 @@
+ 
+ #include "version_major.h"
+ 
+-#define LIBAVFILTER_VERSION_MINOR  15
+-#define LIBAVFILTER_VERSION_MICRO 101
++#define LIBAVFILTER_VERSION_MINOR  16
++#define LIBAVFILTER_VERSION_MICRO 100
+ 
+ 
+ #define LIBAVFILTER_VERSION_INT AV_VERSION_INT(LIBAVFILTER_VERSION_MAJOR, \
+diff --git a/libswresample/swresample.h b/libswresample/swresample.h
+index 052089a..0c4218c 100644
+--- a/libswresample/swresample.h
++++ b/libswresample/swresample.h
+@@ -579,6 +579,39 @@ int swr_convert_frame(SwrContext *swr,
+  */
+ int swr_config_frame(SwrContext *swr, const AVFrame *out, const AVFrame *in);
+ 
++/**
++ * Serialise the internal state of an initialised SwrContext into an opaque
++ * byte buffer. Intended for resuming a streaming resample across process /
++ * instance boundaries with bit-exact continuity.
++ *
++ * On success, *buf is set to a freshly av_malloc()ed buffer that the caller
++ * owns and must release with av_free(), and *size is set to its length.
++ * On failure *buf is NULL and *size is 0.
++ *
++ * The buffer format is the stable FFSA wire format (component
++ * FFSA_COMPONENT_ARESAMPLE = 0x0002). The configuration identifying
++ * (rates, formats, channel layouts, resampler options) is fingerprinted
++ * inside; swr_set_state() rejects blobs whose config does not match.
++ *
++ * Must be called on an initialised SwrContext (after swr_init()).
++ *
++ * @return 0 on success, a negative AVERROR on failure.
++ */
++int swr_get_state(struct SwrContext *s, uint8_t **buf, size_t *size);
++
++/**
++ * Restore previously-serialised SwrContext state into a freshly-initialised
++ * SwrContext. Must be called AFTER swr_init() and with all configuration
++ * (rates, formats, layouts, flags) matching the snapshot's.
++ *
++ * The restore is two-pass: the blob is fully validated (header, sizes,
++ * CRC, required atoms) before any target state is mutated.
++ *
++ * @return 0 on success, a negative AVERROR on failure. On failure the
++ *         SwrContext is left in its pre-call state.
++ */
++int swr_set_state(struct SwrContext *s, const uint8_t *buf, size_t size);
++
+ /**
+  * @}
+  * @}
+diff --git a/libswresample/version.h b/libswresample/version.h
+index 9a514e6..cf32791 100644
+--- a/libswresample/version.h
++++ b/libswresample/version.h
+@@ -30,7 +30,7 @@
+ 
+ #include "version_major.h"
+ 
+-#define LIBSWRESAMPLE_VERSION_MINOR   4
++#define LIBSWRESAMPLE_VERSION_MINOR   5
+ #define LIBSWRESAMPLE_VERSION_MICRO 100
+ 
+ #define LIBSWRESAMPLE_VERSION_INT  AV_VERSION_INT(LIBSWRESAMPLE_VERSION_MAJOR, \

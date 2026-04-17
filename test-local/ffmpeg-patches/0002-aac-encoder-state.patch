@@ -1,0 +1,958 @@
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 85d3591..66c4bbb 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -206,6 +206,7 @@ OBJS-$(CONFIG_AAC_ENCODER)             += aacenc.o aaccoder.o aacenctab.o    \
+                                           aacpsy.o aactab.o      \
+                                           aacenc_is.o \
+                                           aacenc_tns.o \
++                                          aacenc_state.o state_format.o \
+                                           psymodel.o kbdwin.o \
+                                           mpeg4audio_sample_rates.o
+ OBJS-$(CONFIG_AAC_MEDIACODEC_DECODER)  += mediacodecdec.o
+diff --git a/libavcodec/aacpsy.c b/libavcodec/aacpsy.c
+index 299a0a9..d9dd77a 100644
+--- a/libavcodec/aacpsy.c
++++ b/libavcodec/aacpsy.c
+@@ -1023,3 +1023,183 @@ const FFPsyModel ff_aac_psy_model =
+     .analyze = psy_3gpp_analyze,
+     .end     = psy_3gpp_end,
+ };
++
++/* -------------------------------------------------------------- state --- */
++/* Accessors used by the AAC encoder state serialiser. Kept here so that
++ * AacPsyContext / AacPsyChannel remain file-private. Keep field ordering
++ * synchronised with FF_AACPSY_BAND_RECORD_SIZE in aacpsy_state.h. */
++
++#include "aacpsy_state.h"
++
++static inline AacPsyContext *psy_priv(const FFPsyContext *ctx)
++{
++    return (AacPsyContext *)ctx->model_priv_data;
++}
++
++int ff_aacpsy_get_fill_level(const FFPsyContext *ctx)
++{
++    return psy_priv(ctx)->fill_level;
++}
++void ff_aacpsy_set_fill_level(FFPsyContext *ctx, int v)
++{
++    psy_priv(ctx)->fill_level = v;
++}
++void ff_aacpsy_get_pe(const FFPsyContext *ctx, float pe[4])
++{
++    AacPsyContext *p = psy_priv(ctx);
++    pe[0] = p->pe.min;
++    pe[1] = p->pe.max;
++    pe[2] = p->pe.previous;
++    pe[3] = p->pe.correction;
++}
++void ff_aacpsy_set_pe(FFPsyContext *ctx, const float pe[4])
++{
++    AacPsyContext *p = psy_priv(ctx);
++    p->pe.min        = pe[0];
++    p->pe.max        = pe[1];
++    p->pe.previous   = pe[2];
++    p->pe.correction = pe[3];
++}
++
++/* Serialise one AacPsyBand record into 36 bytes of host-order IEEE 754
++ * floats and a host-order int32. Caller converts to big-endian. */
++static void band_pack(const AacPsyBand *b, uint8_t *p)
++{
++    memcpy(p + 0,  &b->energy,       4);
++    memcpy(p + 4,  &b->thr,          4);
++    memcpy(p + 8,  &b->thr_quiet,    4);
++    memcpy(p + 12, &b->nz_lines,     4);
++    memcpy(p + 16, &b->active_lines, 4);
++    memcpy(p + 20, &b->pe,           4);
++    memcpy(p + 24, &b->pe_const,     4);
++    memcpy(p + 28, &b->norm_fac,     4);
++    memcpy(p + 32, &b->avoid_holes,  4);
++}
++static void band_unpack(AacPsyBand *b, const uint8_t *p)
++{
++    memcpy(&b->energy,       p + 0,  4);
++    memcpy(&b->thr,          p + 4,  4);
++    memcpy(&b->thr_quiet,    p + 8,  4);
++    memcpy(&b->nz_lines,     p + 12, 4);
++    memcpy(&b->active_lines, p + 16, 4);
++    memcpy(&b->pe,           p + 20, 4);
++    memcpy(&b->pe_const,     p + 24, 4);
++    memcpy(&b->norm_fac,     p + 28, 4);
++    memcpy(&b->avoid_holes,  p + 32, 4);
++}
++
++void ff_aacpsy_get_prev_band(const FFPsyContext *ctx, int ch,
++                             uint8_t out[FF_AACPSY_BAND_RECORD_SIZE * 128])
++{
++    AacPsyChannel *pch = &psy_priv(ctx)->ch[ch];
++    int i;
++    for (i = 0; i < 128; i++)
++        band_pack(&pch->prev_band[i], out + i * FF_AACPSY_BAND_RECORD_SIZE);
++}
++void ff_aacpsy_set_prev_band(FFPsyContext *ctx, int ch,
++                             const uint8_t in[FF_AACPSY_BAND_RECORD_SIZE * 128])
++{
++    AacPsyChannel *pch = &psy_priv(ctx)->ch[ch];
++    int i;
++    for (i = 0; i < 128; i++)
++        band_unpack(&pch->prev_band[i], in + i * FF_AACPSY_BAND_RECORD_SIZE);
++    /* At the end of psy_3gpp_analyze_channel the encoder does
++     *   memcpy(pch->prev_band, pch->band, sizeof(pch->band));
++     * so the frame-boundary semantics are "band and prev_band are byte-
++     * identical". The analyze path only rewrites bands [0..num_bands-1]
++     * (per window for short frames), so bands never touched by the
++     * current frame's window type retain their last-written values from
++     * prior frames in a continuous encoder. On a fresh encoder band[] is
++     * zero from av_calloc — missing that history causes different
++     * band[] contents after the first post-restore analyze, which then
++     * propagates through memcpy into prev_band and diverges the psy
++     * model over subsequent frames. Restoring band = prev_band at
++     * set_state time reproduces the continuous-encoder invariant. */
++    memcpy(pch->band, pch->prev_band, sizeof(pch->band));
++}
++
++float ff_aacpsy_get_win_energy(const FFPsyContext *ctx, int ch)
++{
++    return psy_priv(ctx)->ch[ch].win_energy;
++}
++void ff_aacpsy_set_win_energy(FFPsyContext *ctx, int ch, float v)
++{
++    psy_priv(ctx)->ch[ch].win_energy = v;
++}
++void ff_aacpsy_get_iir_state(const FFPsyContext *ctx, int ch, float out[2])
++{
++    AacPsyChannel *pch = &psy_priv(ctx)->ch[ch];
++    out[0] = pch->iir_state[0];
++    out[1] = pch->iir_state[1];
++}
++void ff_aacpsy_set_iir_state(FFPsyContext *ctx, int ch, const float in[2])
++{
++    AacPsyChannel *pch = &psy_priv(ctx)->ch[ch];
++    pch->iir_state[0] = in[0];
++    pch->iir_state[1] = in[1];
++}
++uint8_t ff_aacpsy_get_next_grouping(const FFPsyContext *ctx, int ch)
++{
++    return psy_priv(ctx)->ch[ch].next_grouping;
++}
++void ff_aacpsy_set_next_grouping(FFPsyContext *ctx, int ch, uint8_t v)
++{
++    psy_priv(ctx)->ch[ch].next_grouping = v;
++}
++int ff_aacpsy_get_next_window_seq(const FFPsyContext *ctx, int ch)
++{
++    return (int)psy_priv(ctx)->ch[ch].next_window_seq;
++}
++void ff_aacpsy_set_next_window_seq(FFPsyContext *ctx, int ch, int v)
++{
++    psy_priv(ctx)->ch[ch].next_window_seq = (enum WindowSequence)v;
++}
++void ff_aacpsy_get_prev_energy_subshort(const FFPsyContext *ctx, int ch, float out[16])
++{
++    AacPsyChannel *pch = &psy_priv(ctx)->ch[ch];
++    int i;
++    for (i = 0; i < 16; i++)
++        out[i] = pch->prev_energy_subshort[i];
++}
++void ff_aacpsy_set_prev_energy_subshort(FFPsyContext *ctx, int ch, const float in[16])
++{
++    AacPsyChannel *pch = &psy_priv(ctx)->ch[ch];
++    int i;
++    for (i = 0; i < 16; i++)
++        pch->prev_energy_subshort[i] = in[i];
++}
++int ff_aacpsy_get_prev_attack(const FFPsyContext *ctx, int ch)
++{
++    return psy_priv(ctx)->ch[ch].prev_attack;
++}
++void ff_aacpsy_set_prev_attack(FFPsyContext *ctx, int ch, int v)
++{
++    psy_priv(ctx)->ch[ch].prev_attack = v;
++}
++int ff_aacpsy_get_next_attack0_zero(const FFPsyContext *ctx, int ch)
++{
++    return psy_priv(ctx)->ch[ch].next_attack0_zero;
++}
++void ff_aacpsy_set_next_attack0_zero(FFPsyContext *ctx, int ch, int v)
++{
++    psy_priv(ctx)->ch[ch].next_attack0_zero = v;
++}
++
++void ff_aacpsy_get_coef_min_snr(const FFPsyContext *ctx,
++                                float out[FF_AACPSY_COEF_MIN_SNR_COUNT])
++{
++    AacPsyContext *p = psy_priv(ctx);
++    int j, g;
++    for (j = 0; j < 2; j++)
++        for (g = 0; g < 64; g++)
++            out[j * 64 + g] = p->psy_coef[j][g].min_snr;
++}
++void ff_aacpsy_set_coef_min_snr(FFPsyContext *ctx,
++                                const float in[FF_AACPSY_COEF_MIN_SNR_COUNT])
++{
++    AacPsyContext *p = psy_priv(ctx);
++    int j, g;
++    for (j = 0; j < 2; j++)
++        for (g = 0; g < 64; g++)
++            p->psy_coef[j][g].min_snr = in[j * 64 + g];
++}
+diff --git a/libavcodec/aacenc_state.c b/libavcodec/aacenc_state.c
+new file mode 100644
+index 0000000..d91b4f6
+--- /dev/null
++++ b/libavcodec/aacenc_state.c
+@@ -0,0 +1,650 @@
++/*
++ * AAC encoder — state snapshot/restore.
++ *
++ * Implements avcodec_{get,set}_encoder_state for the native AAC-LC encoder.
++ * Serialises the 19-atom state set documented in
++ * stateful-aac-validation/research/aac-encoder-state.md into the FFSA wire
++ * format (state_format.c). The restore path is two-pass: validate first,
++ * only mutate on success.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <string.h>
++
++#include "libavutil/mem.h"
++#include "libavutil/error.h"
++
++#include "avcodec.h"
++#include "version.h"
++
++#include "aac.h"
++#include "aacenc.h"
++#include "aacenc_state.h"
++#include "aacpsy_state.h"
++#include "state_format.h"
++
++#define AAC_COMPONENT_VERSION 0x0001
++#define AAC_NB_PLANAR_SAMPLES 3072  /* 3 × 1024 per channel */
++
++/* --------------------------------------------------------- config hash -- */
++
++static uint64_t compute_config_hash(AVCodecContext *avctx, AACEncContext *s)
++{
++    uint8_t buf[256];
++    size_t off = 0;
++    uint64_t layout_mask;
++    uint32_t masked_flags;
++
++    /* u32 component_id, u32 component_version */
++    ff_ffsa_wr_u32be(buf + off, FFSA_COMPONENT_AAC_ENCODER); off += 4;
++    ff_ffsa_wr_u32be(buf + off, AAC_COMPONENT_VERSION);     off += 4;
++    /* u32 sample_rate */
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)avctx->sample_rate); off += 4;
++    /* u32 nb_channels */
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)avctx->ch_layout.nb_channels); off += 4;
++    /* u64 channel_layout_mask (native mask or 0 for custom) */
++    if (avctx->ch_layout.order == AV_CHANNEL_ORDER_NATIVE)
++        layout_mask = avctx->ch_layout.u.mask;
++    else
++        layout_mask = 0;
++    ff_ffsa_wr_u64be(buf + off, layout_mask); off += 8;
++    /* u32 profile, bit_rate, i32 global_quality, u32 cutoff, masked flags */
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)avctx->profile); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)avctx->bit_rate); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)avctx->global_quality); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)avctx->cutoff); off += 4;
++    masked_flags = (uint32_t)(avctx->flags &
++                              (AV_CODEC_FLAG_BITEXACT | AV_CODEC_FLAG_QSCALE));
++    ff_ffsa_wr_u32be(buf + off, masked_flags); off += 4;
++    /* 6 u8 option fields */
++    buf[off++] = (uint8_t)s->options.coder;
++    buf[off++] = (uint8_t)s->options.pns;
++    buf[off++] = (uint8_t)s->options.tns;
++    buf[off++] = (uint8_t)s->options.pce;
++    buf[off++] = (uint8_t)s->options.mid_side;
++    buf[off++] = (uint8_t)s->options.intensity_stereo;
++    /* u32 frame_size (always 1024 for this encoder) */
++    ff_ffsa_wr_u32be(buf + off, 1024); off += 4;
++
++    return ff_ffsa_sha256_prefix64(buf, off);
++}
++
++static uint32_t compute_build_hash(void)
++{
++    const char *ident = av_version_info();
++    if (!ident)
++        return 0;
++    return ff_ffsa_crc32((const uint8_t *)ident, strlen(ident));
++}
++
++/* ----------------------------------------------------------- snapshot -- */
++
++int ff_aac_encoder_get_state(AVCodecContext *avctx,
++                             uint8_t **out_buf, size_t *out_size)
++{
++    AACEncContext *s = avctx->priv_data;
++    FFSAWriter w;
++    uint16_t flags = 0;
++    uint8_t tmp[32];
++    int nb_channels = avctx->ch_layout.nb_channels;
++    int ch, i, ret;
++    const int bitexact = !!(avctx->flags & AV_CODEC_FLAG_BITEXACT);
++
++    if (!out_buf || !out_size)
++        return AVERROR(EINVAL);
++    if (bitexact)
++        flags |= FFSA_FLAG_BITEXACT;
++
++    ret = ff_ffsa_writer_begin(&w,
++                               FFSA_COMPONENT_AAC_ENCODER,
++                               AAC_COMPONENT_VERSION,
++                               LIBAVCODEC_VERSION_INT,
++                               compute_build_hash(),
++                               compute_config_hash(avctx, s),
++                               flags);
++    if (ret < 0)
++        return ret;
++
++    /* 0x0001 AAC_PLANAR_SAMPLES — 3072 f32 per channel, ch-0 first */
++    {
++        uint32_t total = (uint32_t)nb_channels * AAC_NB_PLANAR_SAMPLES * 4;
++        uint8_t *payload = av_malloc(total);
++        if (!payload) { ret = AVERROR(ENOMEM); goto fail; }
++        for (ch = 0; ch < nb_channels; ch++) {
++            const float *src = s->planar_samples[ch];
++            uint8_t *dst = payload + (size_t)ch * AAC_NB_PLANAR_SAMPLES * 4;
++            for (i = 0; i < AAC_NB_PLANAR_SAMPLES; i++)
++                ff_ffsa_wr_f32be(dst + i * 4, src[i]);
++        }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PLANAR_SAMPLES,
++                                      FFSA_ATOM_REQUIRED, payload, total);
++        av_free(payload);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x0002 AAC_LAMBDA (f32) */
++    ff_ffsa_wr_f32be(tmp, s->lambda);
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_LAMBDA,
++                                  FFSA_ATOM_REQUIRED, tmp, 4);
++    if (ret < 0) goto fail;
++
++    /* 0x0003 AAC_RANDOM_STATE (i32) */
++    ff_ffsa_wr_u32be(tmp, (uint32_t)s->random_state);
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_RANDOM_STATE,
++                                  FFSA_ATOM_REQUIRED, tmp, 4);
++    if (ret < 0) goto fail;
++
++    /* 0x0004 AAC_LAST_FRAME_PB_COUNT (i32) */
++    ff_ffsa_wr_u32be(tmp, (uint32_t)s->last_frame_pb_count);
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_LAST_FRAME_PB_COUNT,
++                                  FFSA_ATOM_REQUIRED, tmp, 4);
++    if (ret < 0) goto fail;
++
++    /* 0x0005 AAC_WINDOW_SEQUENCE and 0x0006 AAC_USE_KB_WINDOW.
++     * Layout iterates over the SCEs covered by s->chan_map (which uses the
++     * AAC ordering) — for CPE we walk both channels, for SCE/LFE only one. */
++    {
++        int nb_sce = 0;
++        int window_seq_bytes, use_kb_bytes;
++        uint8_t *ws_buf, *kb_buf;
++
++        for (i = 0; i < s->chan_map[0]; i++) {
++            int tag = s->chan_map[i + 1];
++            nb_sce += (tag == TYPE_CPE) ? 2 : 1;
++        }
++        window_seq_bytes = nb_sce * 2 * 4;
++        use_kb_bytes     = nb_sce * 2;
++        ws_buf = av_malloc(window_seq_bytes);
++        kb_buf = av_malloc(use_kb_bytes);
++        if (!ws_buf || !kb_buf) {
++            av_free(ws_buf); av_free(kb_buf);
++            ret = AVERROR(ENOMEM); goto fail;
++        }
++        {
++            int sce_idx = 0;
++            for (i = 0; i < s->chan_map[0]; i++) {
++                int tag = s->chan_map[i + 1];
++                int chans = (tag == TYPE_CPE) ? 2 : 1;
++                ChannelElement *cpe = &s->cpe[i];
++                int c;
++                for (c = 0; c < chans; c++) {
++                    SingleChannelElement *sce = &cpe->ch[c];
++                    ff_ffsa_wr_u32be(ws_buf + (sce_idx * 2 + 0) * 4,
++                                     (uint32_t)sce->ics.window_sequence[0]);
++                    ff_ffsa_wr_u32be(ws_buf + (sce_idx * 2 + 1) * 4,
++                                     (uint32_t)sce->ics.window_sequence[1]);
++                    kb_buf[sce_idx * 2 + 0] = sce->ics.use_kb_window[0];
++                    kb_buf[sce_idx * 2 + 1] = sce->ics.use_kb_window[1];
++                    sce_idx++;
++                }
++            }
++        }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_WINDOW_SEQUENCE,
++                                      FFSA_ATOM_REQUIRED, ws_buf, window_seq_bytes);
++        av_free(ws_buf);
++        if (ret < 0) { av_free(kb_buf); goto fail; }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_USE_KB_WINDOW,
++                                      FFSA_ATOM_REQUIRED, kb_buf, use_kb_bytes);
++        av_free(kb_buf);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x0007 AAC_PSY_FILL_LEVEL */
++    ff_ffsa_wr_u32be(tmp, (uint32_t)ff_aacpsy_get_fill_level(&s->psy));
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_FILL_LEVEL,
++                                  FFSA_ATOM_REQUIRED, tmp, 4);
++    if (ret < 0) goto fail;
++
++    /* 0x0008 AAC_PSY_PE (min, max, previous, correction) */
++    {
++        float pe[4];
++        uint8_t buf[16];
++        ff_aacpsy_get_pe(&s->psy, pe);
++        for (i = 0; i < 4; i++)
++            ff_ffsa_wr_f32be(buf + i * 4, pe[i]);
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_PE,
++                                      FFSA_ATOM_REQUIRED, buf, 16);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x0009 AAC_PSY_PREV_BAND — per channel, 128 × 36 B */
++    {
++        uint32_t total = (uint32_t)nb_channels * 128 * FF_AACPSY_BAND_RECORD_SIZE;
++        uint8_t *buf = av_malloc(total);
++        if (!buf) { ret = AVERROR(ENOMEM); goto fail; }
++        for (ch = 0; ch < nb_channels; ch++) {
++            uint8_t *dst = buf + (size_t)ch * 128 * FF_AACPSY_BAND_RECORD_SIZE;
++            uint8_t host[128 * FF_AACPSY_BAND_RECORD_SIZE];
++            int b;
++            ff_aacpsy_get_prev_band(&s->psy, ch, host);
++            /* Each record = 8 f32 + 1 i32 — convert to big-endian. */
++            for (b = 0; b < 128; b++) {
++                const uint8_t *h = host + b * FF_AACPSY_BAND_RECORD_SIZE;
++                uint8_t *d = dst + b * FF_AACPSY_BAND_RECORD_SIZE;
++                int f;
++                for (f = 0; f < 8; f++) {
++                    float v;
++                    memcpy(&v, h + f * 4, 4);
++                    ff_ffsa_wr_f32be(d + f * 4, v);
++                }
++                {
++                    int32_t iv;
++                    memcpy(&iv, h + 32, 4);
++                    ff_ffsa_wr_u32be(d + 32, (uint32_t)iv);
++                }
++            }
++        }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_PREV_BAND,
++                                      FFSA_ATOM_REQUIRED, buf, total);
++        av_free(buf);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x000A AAC_PSY_WIN_ENERGY (nb_channels × f32) */
++    {
++        uint8_t *buf = av_malloc(nb_channels * 4);
++        if (!buf) { ret = AVERROR(ENOMEM); goto fail; }
++        for (ch = 0; ch < nb_channels; ch++)
++            ff_ffsa_wr_f32be(buf + ch * 4, ff_aacpsy_get_win_energy(&s->psy, ch));
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_WIN_ENERGY,
++                                      FFSA_ATOM_REQUIRED, buf, nb_channels * 4);
++        av_free(buf);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x000B AAC_PSY_IIR_STATE (nb_channels × 2 × f32) */
++    {
++        uint8_t *buf = av_malloc(nb_channels * 8);
++        if (!buf) { ret = AVERROR(ENOMEM); goto fail; }
++        for (ch = 0; ch < nb_channels; ch++) {
++            float st[2];
++            ff_aacpsy_get_iir_state(&s->psy, ch, st);
++            ff_ffsa_wr_f32be(buf + ch * 8 + 0, st[0]);
++            ff_ffsa_wr_f32be(buf + ch * 8 + 4, st[1]);
++        }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_IIR_STATE,
++                                      FFSA_ATOM_REQUIRED, buf, nb_channels * 8);
++        av_free(buf);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x000C AAC_PSY_NEXT_GROUPING (nb_channels × u8) */
++    {
++        uint8_t *buf = av_malloc(nb_channels);
++        if (!buf) { ret = AVERROR(ENOMEM); goto fail; }
++        for (ch = 0; ch < nb_channels; ch++)
++            buf[ch] = ff_aacpsy_get_next_grouping(&s->psy, ch);
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_NEXT_GROUPING,
++                                      FFSA_ATOM_REQUIRED, buf, nb_channels);
++        av_free(buf);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x000D AAC_PSY_NEXT_WINDOW_SEQ (nb_channels × i32) */
++    {
++        uint8_t *buf = av_malloc(nb_channels * 4);
++        if (!buf) { ret = AVERROR(ENOMEM); goto fail; }
++        for (ch = 0; ch < nb_channels; ch++)
++            ff_ffsa_wr_u32be(buf + ch * 4,
++                             (uint32_t)ff_aacpsy_get_next_window_seq(&s->psy, ch));
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_NEXT_WINDOW_SEQ,
++                                      FFSA_ATOM_REQUIRED, buf, nb_channels * 4);
++        av_free(buf);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x000E AAC_PSY_PREV_ENERGY_SUBSHORT (nb_channels × 16 × f32) */
++    {
++        uint8_t *buf = av_malloc(nb_channels * 16 * 4);
++        if (!buf) { ret = AVERROR(ENOMEM); goto fail; }
++        for (ch = 0; ch < nb_channels; ch++) {
++            float es[16];
++            ff_aacpsy_get_prev_energy_subshort(&s->psy, ch, es);
++            for (i = 0; i < 16; i++)
++                ff_ffsa_wr_f32be(buf + ch * 64 + i * 4, es[i]);
++        }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_PREV_ENERGY_SUBSHORT,
++                                      FFSA_ATOM_REQUIRED, buf, nb_channels * 64);
++        av_free(buf);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x000F AAC_PSY_PREV_ATTACK (nb_channels × i32) */
++    {
++        uint8_t *buf = av_malloc(nb_channels * 4);
++        if (!buf) { ret = AVERROR(ENOMEM); goto fail; }
++        for (ch = 0; ch < nb_channels; ch++)
++            ff_ffsa_wr_u32be(buf + ch * 4,
++                             (uint32_t)ff_aacpsy_get_prev_attack(&s->psy, ch));
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_PREV_ATTACK,
++                                      FFSA_ATOM_REQUIRED, buf, nb_channels * 4);
++        av_free(buf);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x0010 AAC_PSY_NEXT_ATTACK0_ZERO (nb_channels × i32) */
++    {
++        uint8_t *buf = av_malloc(nb_channels * 4);
++        if (!buf) { ret = AVERROR(ENOMEM); goto fail; }
++        for (ch = 0; ch < nb_channels; ch++)
++            ff_ffsa_wr_u32be(buf + ch * 4,
++                             (uint32_t)ff_aacpsy_get_next_attack0_zero(&s->psy, ch));
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_NEXT_ATTACK0_ZERO,
++                                      FFSA_ATOM_REQUIRED, buf, nb_channels * 4);
++        av_free(buf);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x0011 AAC_AFQ_HEADER (remaining_delay, remaining_samples, frame_count) */
++    {
++        uint8_t buf[12];
++        ff_ffsa_wr_u32be(buf + 0, (uint32_t)s->afq.remaining_delay);
++        ff_ffsa_wr_u32be(buf + 4, (uint32_t)s->afq.remaining_samples);
++        ff_ffsa_wr_u32be(buf + 8, (uint32_t)s->afq.frame_count);
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_AFQ_HEADER,
++                                      FFSA_ATOM_REQUIRED, buf, 12);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x0012 AAC_AFQ_FRAMES (frame_count × {i64 pts, i32 duration, u32 reserved=0}) */
++    {
++        uint32_t count = s->afq.frame_count;
++        uint32_t len = count * 16;
++        uint8_t *buf = len ? av_malloc(len) : NULL;
++        if (len && !buf) { ret = AVERROR(ENOMEM); goto fail; }
++        for (i = 0; i < (int)count; i++) {
++            ff_ffsa_wr_u64be(buf + i * 16 + 0, (uint64_t)s->afq.frames[i].pts);
++            ff_ffsa_wr_u32be(buf + i * 16 + 8, (uint32_t)s->afq.frames[i].duration);
++            ff_ffsa_wr_u32be(buf + i * 16 + 12, 0);
++        }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_AFQ_FRAMES,
++                                      FFSA_ATOM_REQUIRED, buf, len);
++        av_free(buf);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x0014 AAC_PSY_CUTOFF — persistent cutoff written by the twoloop
++     * coder (aaccoder_twoloop.h:197) when avctx->cutoff==0. Without this
++     * the psy analyzer's bandwidth differs between continuous and
++     * restored encoders on frame N+1. i32. */
++    ff_ffsa_wr_u32be(tmp, (uint32_t)s->psy.cutoff);
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_CUTOFF,
++                                  FFSA_ATOM_REQUIRED, tmp, 4);
++    if (ret < 0) goto fail;
++
++    /* 0x0015 AAC_PSY_COEF_MIN_SNR — min_snr inside psy_coef[2][64] is
++     * MUTATED by psy_3gpp_analyze_channel at aacpsy.c:852-853 during the
++     * "further perceptual entropy reduction" path and persists across
++     * frames. 128 × f32 = 512 bytes. */
++    {
++        float snr[FF_AACPSY_COEF_MIN_SNR_COUNT];
++        uint8_t buf[FF_AACPSY_COEF_MIN_SNR_COUNT * 4];
++        ff_aacpsy_get_coef_min_snr(&s->psy, snr);
++        for (i = 0; i < FF_AACPSY_COEF_MIN_SNR_COUNT; i++)
++            ff_ffsa_wr_f32be(buf + i * 4, snr[i]);
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_PSY_COEF_MIN_SNR,
++                                      FFSA_ATOM_REQUIRED, buf, sizeof(buf));
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x0013 AAC_FRAME_NUM — always restored. BITEXACT suppresses the
++     * periodic LIBAVCODEC_IDENT filler but frame_num is also used as the
++     * "skip first frame (lookahead)" gate at aacenc.c and must be correct
++     * after a restore. Spec marks this atom REQUIRED iff !BITEXACT; we
++     * mark it REQUIRED unconditionally for robustness. */
++    ff_ffsa_wr_u64be(tmp, (uint64_t)avctx->frame_num);
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_FRAME_NUM,
++                                  FFSA_ATOM_REQUIRED, tmp, 8);
++    if (ret < 0) goto fail;
++
++    ret = ff_ffsa_writer_finish(&w, out_buf, out_size);
++    if (ret < 0)
++        goto fail;
++    return 0;
++
++fail:
++    ff_ffsa_writer_abort(&w);
++    *out_buf = NULL;
++    *out_size = 0;
++    return ret;
++}
++
++/* ------------------------------------------------------------- restore -- */
++
++int ff_aac_encoder_set_state(AVCodecContext *avctx,
++                             const uint8_t *buf, size_t size)
++{
++    AACEncContext *s = avctx->priv_data;
++    FFSAReader r;
++    const uint8_t *val;
++    uint32_t vlen;
++    int nb_channels = avctx->ch_layout.nb_channels;
++    int ch, i, ret;
++    int nb_sce = 0;
++
++    /* pass 1: validate blob integrity */
++    ret = ff_ffsa_reader_validate(&r, buf, size);
++    if (ret < 0)
++        return ret;
++
++    if (r.header.component_id != FFSA_COMPONENT_AAC_ENCODER)
++        return AVERROR(EINVAL);
++    if (r.header.component_version != AAC_COMPONENT_VERSION)
++        return AVERROR(EINVAL);
++    if (r.header.config_hash != compute_config_hash(avctx, s))
++        return AVERROR(EINVAL);
++
++    for (i = 0; i < s->chan_map[0]; i++) {
++        int tag = s->chan_map[i + 1];
++        nb_sce += (tag == TYPE_CPE) ? 2 : 1;
++    }
++
++    /* pass 1b: confirm every required atom is present AND sized correctly.
++     * We do this before any mutation. */
++    {
++        struct { uint16_t tag; uint32_t expected; } req[] = {
++            { FFSA_AAC_PLANAR_SAMPLES,           (uint32_t)nb_channels * AAC_NB_PLANAR_SAMPLES * 4 },
++            { FFSA_AAC_LAMBDA,                   4 },
++            { FFSA_AAC_RANDOM_STATE,             4 },
++            { FFSA_AAC_LAST_FRAME_PB_COUNT,      4 },
++            { FFSA_AAC_WINDOW_SEQUENCE,          (uint32_t)nb_sce * 2 * 4 },
++            { FFSA_AAC_USE_KB_WINDOW,            (uint32_t)nb_sce * 2 },
++            { FFSA_AAC_PSY_FILL_LEVEL,           4 },
++            { FFSA_AAC_PSY_PE,                   16 },
++            { FFSA_AAC_PSY_PREV_BAND,            (uint32_t)nb_channels * 128 * FF_AACPSY_BAND_RECORD_SIZE },
++            { FFSA_AAC_PSY_WIN_ENERGY,           (uint32_t)nb_channels * 4 },
++            { FFSA_AAC_PSY_IIR_STATE,            (uint32_t)nb_channels * 8 },
++            { FFSA_AAC_PSY_NEXT_GROUPING,        (uint32_t)nb_channels },
++            { FFSA_AAC_PSY_NEXT_WINDOW_SEQ,      (uint32_t)nb_channels * 4 },
++            { FFSA_AAC_PSY_PREV_ENERGY_SUBSHORT, (uint32_t)nb_channels * 16 * 4 },
++            { FFSA_AAC_PSY_PREV_ATTACK,          (uint32_t)nb_channels * 4 },
++            { FFSA_AAC_PSY_NEXT_ATTACK0_ZERO,    (uint32_t)nb_channels * 4 },
++            { FFSA_AAC_AFQ_HEADER,               12 },
++            { FFSA_AAC_PSY_CUTOFF,               4 },
++            { FFSA_AAC_PSY_COEF_MIN_SNR,         FF_AACPSY_COEF_MIN_SNR_COUNT * 4 },
++        };
++        size_t k;
++        for (k = 0; k < sizeof(req) / sizeof(req[0]); k++) {
++            if (!ff_ffsa_reader_find(&r, req[k].tag, &val, &vlen))
++                return AVERROR(EINVAL);
++            if (vlen != req[k].expected)
++                return AVERROR(EINVAL);
++        }
++        /* AAC_AFQ_FRAMES: length is a multiple of 16, and must match the header */
++        if (!ff_ffsa_reader_find(&r, FFSA_AAC_AFQ_HEADER, &val, &vlen))
++            return AVERROR(EINVAL);
++        {
++            uint32_t hdr_frame_count = ff_ffsa_rd_u32be(val + 8);
++            const uint8_t *fv;
++            uint32_t fl;
++            if (!ff_ffsa_reader_find(&r, FFSA_AAC_AFQ_FRAMES, &fv, &fl))
++                return AVERROR(EINVAL);
++            if (fl != hdr_frame_count * 16)
++                return AVERROR(EINVAL);
++        }
++        if (!ff_ffsa_reader_find(&r, FFSA_AAC_FRAME_NUM, &val, &vlen))
++            return AVERROR(EINVAL);
++        if (vlen != 8)
++            return AVERROR(EINVAL);
++    }
++
++    /* pass 2: apply atoms. No allocation failures possible from here. */
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PLANAR_SAMPLES, &val, &vlen);
++    for (ch = 0; ch < nb_channels; ch++) {
++        float *dst = s->planar_samples[ch];
++        const uint8_t *src = val + (size_t)ch * AAC_NB_PLANAR_SAMPLES * 4;
++        for (i = 0; i < AAC_NB_PLANAR_SAMPLES; i++)
++            dst[i] = ff_ffsa_rd_f32be(src + i * 4);
++    }
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_LAMBDA, &val, &vlen);
++    s->lambda = ff_ffsa_rd_f32be(val);
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_RANDOM_STATE, &val, &vlen);
++    s->random_state = (int32_t)ff_ffsa_rd_u32be(val);
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_LAST_FRAME_PB_COUNT, &val, &vlen);
++    s->last_frame_pb_count = (int32_t)ff_ffsa_rd_u32be(val);
++
++    {
++        const uint8_t *ws, *kb;
++        uint32_t wsl, kbl;
++        int sce_idx = 0;
++        ff_ffsa_reader_find(&r, FFSA_AAC_WINDOW_SEQUENCE, &ws, &wsl);
++        ff_ffsa_reader_find(&r, FFSA_AAC_USE_KB_WINDOW,   &kb, &kbl);
++        for (i = 0; i < s->chan_map[0]; i++) {
++            int tag = s->chan_map[i + 1];
++            int chans = (tag == TYPE_CPE) ? 2 : 1;
++            ChannelElement *cpe = &s->cpe[i];
++            int c;
++            for (c = 0; c < chans; c++) {
++                SingleChannelElement *sce = &cpe->ch[c];
++                sce->ics.window_sequence[0] =
++                    (enum WindowSequence)ff_ffsa_rd_u32be(ws + (sce_idx * 2 + 0) * 4);
++                sce->ics.window_sequence[1] =
++                    (enum WindowSequence)ff_ffsa_rd_u32be(ws + (sce_idx * 2 + 1) * 4);
++                sce->ics.use_kb_window[0] = kb[sce_idx * 2 + 0];
++                sce->ics.use_kb_window[1] = kb[sce_idx * 2 + 1];
++                sce_idx++;
++            }
++        }
++    }
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_FILL_LEVEL, &val, &vlen);
++    ff_aacpsy_set_fill_level(&s->psy, (int32_t)ff_ffsa_rd_u32be(val));
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_PE, &val, &vlen);
++    {
++        float pe[4];
++        for (i = 0; i < 4; i++)
++            pe[i] = ff_ffsa_rd_f32be(val + i * 4);
++        ff_aacpsy_set_pe(&s->psy, pe);
++    }
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_PREV_BAND, &val, &vlen);
++    for (ch = 0; ch < nb_channels; ch++) {
++        const uint8_t *src = val + (size_t)ch * 128 * FF_AACPSY_BAND_RECORD_SIZE;
++        uint8_t host[128 * FF_AACPSY_BAND_RECORD_SIZE];
++        int b;
++        for (b = 0; b < 128; b++) {
++            const uint8_t *s_be = src + b * FF_AACPSY_BAND_RECORD_SIZE;
++            uint8_t *h = host + b * FF_AACPSY_BAND_RECORD_SIZE;
++            int f;
++            for (f = 0; f < 8; f++) {
++                float v = ff_ffsa_rd_f32be(s_be + f * 4);
++                memcpy(h + f * 4, &v, 4);
++            }
++            {
++                int32_t iv = (int32_t)ff_ffsa_rd_u32be(s_be + 32);
++                memcpy(h + 32, &iv, 4);
++            }
++        }
++        ff_aacpsy_set_prev_band(&s->psy, ch, host);
++    }
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_WIN_ENERGY, &val, &vlen);
++    for (ch = 0; ch < nb_channels; ch++)
++        ff_aacpsy_set_win_energy(&s->psy, ch, ff_ffsa_rd_f32be(val + ch * 4));
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_IIR_STATE, &val, &vlen);
++    for (ch = 0; ch < nb_channels; ch++) {
++        float st[2];
++        st[0] = ff_ffsa_rd_f32be(val + ch * 8 + 0);
++        st[1] = ff_ffsa_rd_f32be(val + ch * 8 + 4);
++        ff_aacpsy_set_iir_state(&s->psy, ch, st);
++    }
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_NEXT_GROUPING, &val, &vlen);
++    for (ch = 0; ch < nb_channels; ch++)
++        ff_aacpsy_set_next_grouping(&s->psy, ch, val[ch]);
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_NEXT_WINDOW_SEQ, &val, &vlen);
++    for (ch = 0; ch < nb_channels; ch++)
++        ff_aacpsy_set_next_window_seq(&s->psy, ch,
++                                      (int32_t)ff_ffsa_rd_u32be(val + ch * 4));
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_PREV_ENERGY_SUBSHORT, &val, &vlen);
++    for (ch = 0; ch < nb_channels; ch++) {
++        float es[16];
++        for (i = 0; i < 16; i++)
++            es[i] = ff_ffsa_rd_f32be(val + ch * 64 + i * 4);
++        ff_aacpsy_set_prev_energy_subshort(&s->psy, ch, es);
++    }
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_PREV_ATTACK, &val, &vlen);
++    for (ch = 0; ch < nb_channels; ch++)
++        ff_aacpsy_set_prev_attack(&s->psy, ch, (int32_t)ff_ffsa_rd_u32be(val + ch * 4));
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_NEXT_ATTACK0_ZERO, &val, &vlen);
++    for (ch = 0; ch < nb_channels; ch++)
++        ff_aacpsy_set_next_attack0_zero(&s->psy, ch,
++                                        (int32_t)ff_ffsa_rd_u32be(val + ch * 4));
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_AFQ_HEADER, &val, &vlen);
++    s->afq.remaining_delay   = (int32_t)ff_ffsa_rd_u32be(val + 0);
++    s->afq.remaining_samples = (int32_t)ff_ffsa_rd_u32be(val + 4);
++    {
++        uint32_t fc = ff_ffsa_rd_u32be(val + 8);
++        const uint8_t *fv;
++        uint32_t fl;
++        ff_ffsa_reader_find(&r, FFSA_AAC_AFQ_FRAMES, &fv, &fl);
++        /* Grow afq.frames if needed. ff_af_queue_add uses av_fast_realloc
++         * internally; we emulate it here for a bulk restore. */
++        if (fc > s->afq.frame_alloc) {
++            AudioFrame *nb = av_realloc(s->afq.frames,
++                                        sizeof(AudioFrame) * fc);
++            if (!nb)
++                return AVERROR(ENOMEM); /* pass-2 alloc: acceptable compromise */
++            s->afq.frames = nb;
++            s->afq.frame_alloc = fc;
++        }
++        for (i = 0; i < (int)fc; i++) {
++            s->afq.frames[i].pts      = (int64_t)ff_ffsa_rd_u64be(fv + i * 16 + 0);
++            s->afq.frames[i].duration = (int32_t)ff_ffsa_rd_u32be(fv + i * 16 + 8);
++        }
++        s->afq.frame_count = fc;
++    }
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_FRAME_NUM, &val, &vlen);
++    avctx->frame_num = (int64_t)ff_ffsa_rd_u64be(val);
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_CUTOFF, &val, &vlen);
++    s->psy.cutoff = (int32_t)ff_ffsa_rd_u32be(val);
++
++    ff_ffsa_reader_find(&r, FFSA_AAC_PSY_COEF_MIN_SNR, &val, &vlen);
++    {
++        float snr[FF_AACPSY_COEF_MIN_SNR_COUNT];
++        for (i = 0; i < FF_AACPSY_COEF_MIN_SNR_COUNT; i++)
++            snr[i] = ff_ffsa_rd_f32be(val + i * 4);
++        ff_aacpsy_set_coef_min_snr(&s->psy, snr);
++    }
++
++    return 0;
++}
+diff --git a/libavcodec/aacenc_state.h b/libavcodec/aacenc_state.h
+new file mode 100644
+index 0000000..8d4f885
+--- /dev/null
++++ b/libavcodec/aacenc_state.h
+@@ -0,0 +1,26 @@
++/*
++ * AAC encoder state snapshot/restore — internal declarations.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef AVCODEC_AACENC_STATE_H
++#define AVCODEC_AACENC_STATE_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#include "avcodec.h"
++
++/* Public-API backing. Callers: avcodec_{get,set}_encoder_state. */
++int ff_aac_encoder_get_state(AVCodecContext *avctx,
++                             uint8_t **buf, size_t *size);
++int ff_aac_encoder_set_state(AVCodecContext *avctx,
++                             const uint8_t *buf, size_t size);
++
++#endif /* AVCODEC_AACENC_STATE_H */
+diff --git a/libavcodec/aacpsy_state.h b/libavcodec/aacpsy_state.h
+new file mode 100644
+index 0000000..70f8630
+--- /dev/null
++++ b/libavcodec/aacpsy_state.h
+@@ -0,0 +1,64 @@
++/*
++ * AAC psychoacoustic model state accessors.
++ *
++ * Private helpers that expose the stateful fields of the 3GPP/LAME psy
++ * model (AacPsyContext / AacPsyChannel) to the AAC encoder's state
++ * serialiser without leaking the struct definitions.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef AVCODEC_AACPSY_STATE_H
++#define AVCODEC_AACPSY_STATE_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#include "psymodel.h"
++
++/* Record layout on the wire for AAC_PSY_PREV_BAND atoms. Must match the
++ * serialisation emitted/consumed in aacenc_state.c. */
++#define FF_AACPSY_BAND_RECORD_SIZE 36   /* 8 × f32 + 1 × i32 */
++
++/* Context scalars (shared across channels). */
++int   ff_aacpsy_get_fill_level(const FFPsyContext *ctx);
++void  ff_aacpsy_set_fill_level(FFPsyContext *ctx, int v);
++void  ff_aacpsy_get_pe(const FFPsyContext *ctx, float pe[4]);
++void  ff_aacpsy_set_pe(FFPsyContext *ctx, const float pe[4]);
++
++/* Per-channel state. All buffers use IEEE 754 host-order floats. The caller
++ * is responsible for endian conversion when emitting FFSA atoms. */
++void  ff_aacpsy_get_prev_band(const FFPsyContext *ctx, int ch,
++                              uint8_t out[FF_AACPSY_BAND_RECORD_SIZE * 128]);
++void  ff_aacpsy_set_prev_band(FFPsyContext *ctx, int ch,
++                              const uint8_t in[FF_AACPSY_BAND_RECORD_SIZE * 128]);
++float ff_aacpsy_get_win_energy(const FFPsyContext *ctx, int ch);
++void  ff_aacpsy_set_win_energy(FFPsyContext *ctx, int ch, float v);
++void  ff_aacpsy_get_iir_state(const FFPsyContext *ctx, int ch, float out[2]);
++void  ff_aacpsy_set_iir_state(FFPsyContext *ctx, int ch, const float in[2]);
++uint8_t ff_aacpsy_get_next_grouping(const FFPsyContext *ctx, int ch);
++void    ff_aacpsy_set_next_grouping(FFPsyContext *ctx, int ch, uint8_t v);
++int   ff_aacpsy_get_next_window_seq(const FFPsyContext *ctx, int ch);
++void  ff_aacpsy_set_next_window_seq(FFPsyContext *ctx, int ch, int v);
++void  ff_aacpsy_get_prev_energy_subshort(const FFPsyContext *ctx, int ch, float out[16]);
++void  ff_aacpsy_set_prev_energy_subshort(FFPsyContext *ctx, int ch, const float in[16]);
++int   ff_aacpsy_get_prev_attack(const FFPsyContext *ctx, int ch);
++void  ff_aacpsy_set_prev_attack(FFPsyContext *ctx, int ch, int v);
++int   ff_aacpsy_get_next_attack0_zero(const FFPsyContext *ctx, int ch);
++void  ff_aacpsy_set_next_attack0_zero(FFPsyContext *ctx, int ch, int v);
++
++/* psy_coef[2][64].min_snr — 2*64 = 128 floats. Mutated by
++ * psy_3gpp_analyze_channel (aacpsy.c:852-853) during reduction loop.
++ * Writes 128 × f32 in host-order. */
++#define FF_AACPSY_COEF_MIN_SNR_COUNT 128
++void ff_aacpsy_get_coef_min_snr(const FFPsyContext *ctx,
++                                float out[FF_AACPSY_COEF_MIN_SNR_COUNT]);
++void ff_aacpsy_set_coef_min_snr(FFPsyContext *ctx,
++                                const float in[FF_AACPSY_COEF_MIN_SNR_COUNT]);
++
++#endif /* AVCODEC_AACPSY_STATE_H */

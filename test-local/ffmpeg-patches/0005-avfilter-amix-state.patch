@@ -1,0 +1,875 @@
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 6a44504..458c679 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -21,6 +21,7 @@ OBJS = allfilters.o                                                     \
+        framequeue.o                                                     \
+        graphdump.o                                                      \
+        graphparser.o                                                    \
++       state_format.o                                                   \
+        version.o                                                        \
+        video.o                                                          \
+ 
+diff --git a/libavfilter/af_amix.c b/libavfilter/af_amix.c
+index 082d69b..bb66de1 100644
+--- a/libavfilter/af_amix.c
++++ b/libavfilter/af_amix.c
+@@ -631,3 +631,425 @@ const FFFilter ff_af_amix = {
+                       AV_SAMPLE_FMT_DBL, AV_SAMPLE_FMT_DBLP),
+     .process_command = process_command,
+ };
++
++/* ---------------------------------------------------------------- state --- */
++/* State snapshot / restore for af_amix. Accessors used by
++ * avfilter_{get,set}_filter_state via af_amix_state.h. Kept here so
++ * MixContext remains file-private.
++ *
++ * Wire format: FFSA component_id=0x0003, component_version=0x0001.
++ * Atoms (all REQUIRED):
++ *   0x2001 AMIX_INPUT_STATE         u8 × nb_inputs
++ *   0x2002 AMIX_SCALE_NORM          f32 × nb_inputs  (BE bit pattern)
++ *   0x2003 AMIX_NEXT_PTS            i64
++ *   0x2004 AMIX_FRAME_LIST_HEADER   i32 nb_frames + i32 nb_samples
++ *   0x2005 AMIX_FRAME_LIST_ENTRIES  { i32 nb_samples, u32 reserved=0, i64 pts }
++ *                                   × nb_frames
++ *   0x2006 AMIX_FIFO_SIZES          i32 × nb_inputs  (per-input queued samples)
++ *   0x2007 AMIX_FIFO_DATA           concatenated per-input planar audio data
++ *                                   with per-plane BE bit pattern for f32/f64
++ */
++
++#include "libavutil/version.h"
++#include "state_format.h"
++#include "af_amix_state.h"
++#include "version.h"
++
++#define AMIX_COMPONENT_VERSION 0x0001
++
++static uint64_t amix_compute_config_hash(const MixContext *s, const AVFilterLink *outlink)
++{
++    uint8_t buf[256];
++    size_t off = 0;
++    int i;
++    union { float f; uint32_t u; } fbits;
++
++    ff_ffsa_wr_u32be(buf + off, FFSA_COMPONENT_AMIX);      off += 4;
++    ff_ffsa_wr_u32be(buf + off, AMIX_COMPONENT_VERSION);   off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->nb_inputs);   off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->sample_rate); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->nb_channels); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)outlink->format);off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->duration_mode); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->normalize);   off += 4;
++    fbits.f = s->dropout_transition;
++    ff_ffsa_wr_u32be(buf + off, fbits.u); off += 4;
++    for (i = 0; i < s->nb_inputs; i++) {
++        fbits.f = s->weights[i];
++        ff_ffsa_wr_u32be(buf + off, fbits.u); off += 4;
++    }
++    return ff_ffsa_sha256_prefix64(buf, off);
++}
++
++static uint32_t amix_compute_build_hash(void)
++{
++    const char *ident = av_version_info();
++    if (!ident)
++        return 0;
++    return ff_ffsa_crc32((const uint8_t *)ident, strlen(ident));
++}
++
++int ff_amix_get_state(AVFilterContext *ctx, uint8_t **out_buf, size_t *out_size)
++{
++    MixContext *s = ctx->priv;
++    AVFilterLink *outlink;
++    FFSAWriter w;
++    uint8_t tmp[32];
++    int ret;
++    int i;
++    int bps;
++    int planes;
++    enum AVSampleFormat fmt;
++
++    if (!ctx || !out_buf || !out_size)
++        return AVERROR(EINVAL);
++    *out_buf = NULL;
++    *out_size = 0;
++    if (!ctx->nb_outputs || !ctx->outputs[0])
++        return AVERROR(EINVAL);
++    outlink = ctx->outputs[0];
++    fmt     = outlink->format;
++    bps     = av_get_bytes_per_sample(fmt);
++    if (bps <= 0 || !s->fifos || !s->input_state || !s->scale_norm)
++        return AVERROR(EINVAL);
++    planes = s->planar ? s->nb_channels : 1;
++
++    ret = ff_ffsa_writer_begin(&w,
++                               FFSA_COMPONENT_AMIX,
++                               AMIX_COMPONENT_VERSION,
++                               LIBAVFILTER_VERSION_INT,
++                               amix_compute_build_hash(),
++                               amix_compute_config_hash(s, outlink),
++                               0);
++    if (ret < 0)
++        return ret;
++
++    /* 0x2001 AMIX_INPUT_STATE */
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_AMIX_INPUT_STATE,
++                                  FFSA_ATOM_REQUIRED,
++                                  s->input_state, (uint32_t)s->nb_inputs);
++    if (ret < 0) goto fail;
++
++    /* 0x2002 AMIX_SCALE_NORM */
++    {
++        uint32_t total = (uint32_t)s->nb_inputs * 4;
++        uint8_t *payload = av_malloc(total);
++        if (!payload) { ret = AVERROR(ENOMEM); goto fail; }
++        for (i = 0; i < s->nb_inputs; i++)
++            ff_ffsa_wr_f32be(payload + i * 4, s->scale_norm[i]);
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AMIX_SCALE_NORM,
++                                      FFSA_ATOM_REQUIRED, payload, total);
++        av_free(payload);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x2003 AMIX_NEXT_PTS */
++    ff_ffsa_wr_u64be(tmp, (uint64_t)s->next_pts);
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_AMIX_NEXT_PTS,
++                                  FFSA_ATOM_REQUIRED, tmp, 8);
++    if (ret < 0) goto fail;
++
++    /* 0x2004 AMIX_FRAME_LIST_HEADER + 0x2005 ENTRIES */
++    {
++        int nb_frames  = s->frame_list ? s->frame_list->nb_frames  : 0;
++        int nb_samples = s->frame_list ? s->frame_list->nb_samples : 0;
++        uint8_t header[8];
++        ff_ffsa_wr_u32be(header + 0, (uint32_t)nb_frames);
++        ff_ffsa_wr_u32be(header + 4, (uint32_t)nb_samples);
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AMIX_FRAME_LIST_HEADER,
++                                      FFSA_ATOM_REQUIRED, header, 8);
++        if (ret < 0) goto fail;
++
++        {
++            uint32_t entries_len = (uint32_t)nb_frames * 16;
++            uint8_t *entries = entries_len ? av_malloc(entries_len) : NULL;
++            FrameInfo *fi;
++            if (entries_len && !entries) { ret = AVERROR(ENOMEM); goto fail; }
++            fi = s->frame_list ? s->frame_list->list : NULL;
++            for (i = 0; i < nb_frames; i++) {
++                if (!fi) { av_free(entries); ret = AVERROR(EINVAL); goto fail; }
++                ff_ffsa_wr_u32be(entries + i * 16 + 0, (uint32_t)fi->nb_samples);
++                ff_ffsa_wr_u32be(entries + i * 16 + 4, 0);
++                ff_ffsa_wr_u64be(entries + i * 16 + 8, (uint64_t)fi->pts);
++                fi = fi->next;
++            }
++            ret = ff_ffsa_writer_add_atom(&w, FFSA_AMIX_FRAME_LIST_ENTRIES,
++                                          FFSA_ATOM_REQUIRED,
++                                          entries, entries_len);
++            av_free(entries);
++            if (ret < 0) goto fail;
++        }
++    }
++
++    /* 0x2006 AMIX_FIFO_SIZES */
++    {
++        uint32_t total = (uint32_t)s->nb_inputs * 4;
++        uint8_t *payload = av_malloc(total);
++        if (!payload) { ret = AVERROR(ENOMEM); goto fail; }
++        for (i = 0; i < s->nb_inputs; i++) {
++            int size = av_audio_fifo_size(s->fifos[i]);
++            ff_ffsa_wr_u32be(payload + i * 4, (uint32_t)size);
++        }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AMIX_FIFO_SIZES,
++                                      FFSA_ATOM_REQUIRED, payload, total);
++        av_free(payload);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x2007 AMIX_FIFO_DATA — concatenated per-input planar audio.
++     * For planar formats AVAudioFifo stores each channel in a separate
++     * sub-fifo; peek writes into data[0..nb_channels-1]. For packed it
++     * writes a single interleaved stream into data[0]. */
++    {
++        uint32_t total_bytes = 0;
++        uint8_t *payload;
++        int off_b = 0;
++        int p;
++        for (i = 0; i < s->nb_inputs; i++) {
++            int size = av_audio_fifo_size(s->fifos[i]);
++            total_bytes += (uint32_t)size * bps * s->nb_channels;
++        }
++        payload = total_bytes ? av_malloc(total_bytes) : NULL;
++        if (total_bytes && !payload) { ret = AVERROR(ENOMEM); goto fail; }
++        for (i = 0; i < s->nb_inputs; i++) {
++            int size = av_audio_fifo_size(s->fifos[i]);
++            int bytes_per_plane;
++            uint8_t *scratch;
++            uint8_t **ptrs;
++            int peek;
++            if (size <= 0)
++                continue;
++            bytes_per_plane = size * bps * (s->planar ? 1 : s->nb_channels);
++            scratch = av_malloc((size_t)planes * (size_t)bytes_per_plane);
++            if (!scratch) { av_free(payload); ret = AVERROR(ENOMEM); goto fail; }
++            ptrs = av_calloc(planes, sizeof(*ptrs));
++            if (!ptrs) { av_free(scratch); av_free(payload); ret = AVERROR(ENOMEM); goto fail; }
++            for (p = 0; p < planes; p++)
++                ptrs[p] = scratch + (size_t)p * bytes_per_plane;
++            peek = av_audio_fifo_peek(s->fifos[i], (void **)ptrs, size);
++            if (peek != size) {
++                av_free(scratch); av_free(ptrs); av_free(payload);
++                ret = AVERROR(EINVAL); goto fail;
++            }
++            /* Endian-convert and append to payload. */
++            {
++                int elem;
++                int total_elems;
++                if (fmt == AV_SAMPLE_FMT_FLTP || fmt == AV_SAMPLE_FMT_DBLP ||
++                    fmt == AV_SAMPLE_FMT_FLT  || fmt == AV_SAMPLE_FMT_DBL) {
++                    total_elems = bytes_per_plane / bps;
++                    for (p = 0; p < planes; p++) {
++                        for (elem = 0; elem < total_elems; elem++) {
++                            if (bps == 4) {
++                                uint32_t v;
++                                memcpy(&v, ptrs[p] + elem * 4, 4);
++                                ff_ffsa_wr_u32be(payload + off_b, v);
++                                off_b += 4;
++                            } else { /* bps == 8 */
++                                uint64_t v;
++                                memcpy(&v, ptrs[p] + elem * 8, 8);
++                                ff_ffsa_wr_u64be(payload + off_b, v);
++                                off_b += 8;
++                            }
++                        }
++                    }
++                } else {
++                    av_free(scratch); av_free(ptrs); av_free(payload);
++                    ret = AVERROR(EINVAL); goto fail;
++                }
++            }
++            av_free(scratch);
++            av_free(ptrs);
++        }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AMIX_FIFO_DATA,
++                                      FFSA_ATOM_REQUIRED,
++                                      payload, total_bytes);
++        av_free(payload);
++        if (ret < 0) goto fail;
++    }
++
++    ret = ff_ffsa_writer_finish(&w, out_buf, out_size);
++    if (ret < 0)
++        goto fail;
++    return 0;
++
++fail:
++    ff_ffsa_writer_abort(&w);
++    *out_buf = NULL;
++    *out_size = 0;
++    return ret;
++}
++
++int ff_amix_set_state(AVFilterContext *ctx, const uint8_t *buf, size_t size)
++{
++    MixContext *s = ctx->priv;
++    AVFilterLink *outlink;
++    FFSAReader r;
++    const uint8_t *val;
++    uint32_t vlen;
++    int ret;
++    int i;
++    int bps;
++    int planes;
++    enum AVSampleFormat fmt;
++
++    if (!ctx || !buf || !size)
++        return AVERROR(EINVAL);
++    if (!ctx->nb_outputs || !ctx->outputs[0])
++        return AVERROR(EINVAL);
++    outlink = ctx->outputs[0];
++    fmt     = outlink->format;
++    bps     = av_get_bytes_per_sample(fmt);
++    if (bps <= 0 || !s->fifos)
++        return AVERROR(EINVAL);
++    planes = s->planar ? s->nb_channels : 1;
++
++    ret = ff_ffsa_reader_validate(&r, buf, size);
++    if (ret < 0)
++        return ret;
++    if (r.header.component_id != FFSA_COMPONENT_AMIX)
++        return AVERROR(EINVAL);
++    if (r.header.component_version != AMIX_COMPONENT_VERSION)
++        return AVERROR(EINVAL);
++    if (r.header.config_hash != amix_compute_config_hash(s, outlink))
++        return AVERROR(EINVAL);
++
++    /* pass 1: all size checks */
++    if (!ff_ffsa_reader_find(&r, FFSA_AMIX_INPUT_STATE, &val, &vlen) ||
++        vlen != (uint32_t)s->nb_inputs)
++        return AVERROR(EINVAL);
++    if (!ff_ffsa_reader_find(&r, FFSA_AMIX_SCALE_NORM, &val, &vlen) ||
++        vlen != (uint32_t)s->nb_inputs * 4)
++        return AVERROR(EINVAL);
++    if (!ff_ffsa_reader_find(&r, FFSA_AMIX_NEXT_PTS, &val, &vlen) || vlen != 8)
++        return AVERROR(EINVAL);
++    if (!ff_ffsa_reader_find(&r, FFSA_AMIX_FRAME_LIST_HEADER, &val, &vlen) ||
++        vlen != 8)
++        return AVERROR(EINVAL);
++    {
++        uint32_t nb_frames = ff_ffsa_rd_u32be(val);
++        const uint8_t *fv;
++        uint32_t fl;
++        if (!ff_ffsa_reader_find(&r, FFSA_AMIX_FRAME_LIST_ENTRIES, &fv, &fl))
++            return AVERROR(EINVAL);
++        if (fl != nb_frames * 16)
++            return AVERROR(EINVAL);
++    }
++    if (!ff_ffsa_reader_find(&r, FFSA_AMIX_FIFO_SIZES, &val, &vlen) ||
++        vlen != (uint32_t)s->nb_inputs * 4)
++        return AVERROR(EINVAL);
++    {
++        /* compute expected FIFO_DATA size */
++        const uint8_t *sv;
++        uint32_t sl;
++        uint32_t expect = 0;
++        ff_ffsa_reader_find(&r, FFSA_AMIX_FIFO_SIZES, &sv, &sl);
++        for (i = 0; i < s->nb_inputs; i++) {
++            uint32_t n = ff_ffsa_rd_u32be(sv + i * 4);
++            expect += n * (uint32_t)bps * (uint32_t)s->nb_channels;
++        }
++        if (!ff_ffsa_reader_find(&r, FFSA_AMIX_FIFO_DATA, &val, &vlen))
++            return AVERROR(EINVAL);
++        if (vlen != expect)
++            return AVERROR(EINVAL);
++    }
++
++    /* pass 2: apply */
++    ff_ffsa_reader_find(&r, FFSA_AMIX_INPUT_STATE, &val, &vlen);
++    memcpy(s->input_state, val, (size_t)s->nb_inputs);
++
++    ff_ffsa_reader_find(&r, FFSA_AMIX_SCALE_NORM, &val, &vlen);
++    for (i = 0; i < s->nb_inputs; i++)
++        s->scale_norm[i] = ff_ffsa_rd_f32be(val + i * 4);
++
++    ff_ffsa_reader_find(&r, FFSA_AMIX_NEXT_PTS, &val, &vlen);
++    s->next_pts = (int64_t)ff_ffsa_rd_u64be(val);
++
++    /* Rebuild frame_list */
++    if (!s->frame_list) {
++        s->frame_list = av_mallocz(sizeof(*s->frame_list));
++        if (!s->frame_list)
++            return AVERROR(ENOMEM);
++    } else {
++        frame_list_clear(s->frame_list);
++    }
++    ff_ffsa_reader_find(&r, FFSA_AMIX_FRAME_LIST_HEADER, &val, &vlen);
++    {
++        uint32_t nb_frames  = ff_ffsa_rd_u32be(val + 0);
++        uint32_t nb_samples = ff_ffsa_rd_u32be(val + 4);
++        const uint8_t *fv;
++        uint32_t fl;
++        ff_ffsa_reader_find(&r, FFSA_AMIX_FRAME_LIST_ENTRIES, &fv, &fl);
++        for (i = 0; i < (int)nb_frames; i++) {
++            int s_n = (int32_t)ff_ffsa_rd_u32be(fv + i * 16 + 0);
++            int64_t s_p = (int64_t)ff_ffsa_rd_u64be(fv + i * 16 + 8);
++            int r2 = frame_list_add_frame(s->frame_list, s_n, s_p);
++            if (r2 < 0)
++                return r2;
++        }
++        (void)nb_samples; /* nb_samples is derived; we assert via frame_list */
++    }
++
++    /* Rebuild FIFOs: reset + write back peeked data. */
++    {
++        const uint8_t *sv;
++        uint32_t sl;
++        const uint8_t *dv;
++        uint32_t dl;
++        int off_b = 0;
++        int p;
++        ff_ffsa_reader_find(&r, FFSA_AMIX_FIFO_SIZES, &sv, &sl);
++        ff_ffsa_reader_find(&r, FFSA_AMIX_FIFO_DATA, &dv, &dl);
++        for (i = 0; i < s->nb_inputs; i++) {
++            int n = (int32_t)ff_ffsa_rd_u32be(sv + i * 4);
++            int bytes_per_plane;
++            uint8_t *scratch;
++            uint8_t **ptrs;
++            int r2;
++            av_audio_fifo_reset(s->fifos[i]);
++            if (n <= 0)
++                continue;
++            bytes_per_plane = n * bps * (s->planar ? 1 : s->nb_channels);
++            scratch = av_malloc((size_t)planes * (size_t)bytes_per_plane);
++            if (!scratch)
++                return AVERROR(ENOMEM);
++            ptrs = av_calloc(planes, sizeof(*ptrs));
++            if (!ptrs) { av_free(scratch); return AVERROR(ENOMEM); }
++            {
++                int elem;
++                int total_elems = bytes_per_plane / bps;
++                for (p = 0; p < planes; p++) {
++                    ptrs[p] = scratch + (size_t)p * bytes_per_plane;
++                    for (elem = 0; elem < total_elems; elem++) {
++                        if (bps == 4) {
++                            uint32_t v = ff_ffsa_rd_u32be(dv + off_b);
++                            memcpy(ptrs[p] + elem * 4, &v, 4);
++                            off_b += 4;
++                        } else {
++                            uint64_t v = ff_ffsa_rd_u64be(dv + off_b);
++                            memcpy(ptrs[p] + elem * 8, &v, 8);
++                            off_b += 8;
++                        }
++                    }
++                }
++            }
++            r2 = av_audio_fifo_write(s->fifos[i], (void **)ptrs, n);
++            av_free(scratch);
++            av_free(ptrs);
++            if (r2 < 0)
++                return r2;
++            if (r2 != n)
++                return AVERROR(ENOMEM);
++        }
++    }
++
++    /* Recompute active_inputs from restored input_state. */
++    {
++        int active = 0;
++        for (i = 0; i < s->nb_inputs; i++)
++            active += !!(s->input_state[i] & INPUT_ON);
++        s->active_inputs = active;
++    }
++
++    return 0;
++}
+diff --git a/libavfilter/af_amix_state.h b/libavfilter/af_amix_state.h
+new file mode 100644
+index 0000000..fc4b647
+--- /dev/null
++++ b/libavfilter/af_amix_state.h
+@@ -0,0 +1,26 @@
++/*
++ * af_amix — state snapshot/restore (internal declarations).
++ *
++ * Private glue between the amix filter and avfilter_{get,set}_filter_state.
++ * Keeps MixContext file-private while exposing the serialise/restore pair.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef AVFILTER_AF_AMIX_STATE_H
++#define AVFILTER_AF_AMIX_STATE_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#include "avfilter.h"
++
++int ff_amix_get_state(AVFilterContext *ctx, uint8_t **buf, size_t *size);
++int ff_amix_set_state(AVFilterContext *ctx, const uint8_t *buf, size_t size);
++
++#endif /* AVFILTER_AF_AMIX_STATE_H */
+diff --git a/libavfilter/state_format.c b/libavfilter/state_format.c
+new file mode 100644
+index 0000000..cd4dbdf
+--- /dev/null
++++ b/libavfilter/state_format.c
+@@ -0,0 +1,239 @@
++/*
++ * FFSA — FFmpeg State Atoms binary format (v1.0) — avfilter copy.
++ *
++ * Behaviourally identical to libavcodec/state_format.c and
++ * libswresample/state_format.c. See avfilter/state_format.h.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <string.h>
++
++#include "libavutil/mem.h"
++#include "libavutil/error.h"
++#include "libavutil/crc.h"
++#include "libavutil/sha.h"
++
++#include "state_format.h"
++
++uint32_t ff_ffsa_crc32(const uint8_t *buf, size_t len)
++{
++    const AVCRC *t = av_crc_get_table(AV_CRC_32_IEEE_LE);
++    if (!t)
++        return 0;
++    return ~av_crc(t, 0xFFFFFFFFu, buf, len);
++}
++
++uint64_t ff_ffsa_sha256_prefix64(const uint8_t *buf, size_t len)
++{
++    struct AVSHA *ctx = av_sha_alloc();
++    uint8_t digest[32];
++    uint64_t out;
++    int i;
++
++    if (!ctx)
++        return 0;
++    av_sha_init(ctx, 256);
++    av_sha_update(ctx, buf, len);
++    av_sha_final(ctx, digest);
++    av_free(ctx);
++
++    out = 0;
++    for (i = 0; i < 8; i++)
++        out = (out << 8) | (uint64_t)digest[i];
++    return out;
++}
++
++static int writer_reserve(FFSAWriter *w, size_t extra)
++{
++    size_t need;
++    uint8_t *nb;
++    if (w->err)
++        return w->err;
++    need = w->size + extra;
++    if (need <= w->cap)
++        return 0;
++    while (w->cap < need)
++        w->cap = w->cap ? w->cap * 2 : 256;
++    nb = av_realloc(w->buf, w->cap);
++    if (!nb) {
++        w->err = AVERROR(ENOMEM);
++        return w->err;
++    }
++    w->buf = nb;
++    return 0;
++}
++
++int ff_ffsa_writer_begin(FFSAWriter *w,
++                         uint16_t component_id,
++                         uint16_t component_version,
++                         uint32_t libav_version,
++                         uint32_t build_hash,
++                         uint64_t config_hash,
++                         uint16_t flags)
++{
++    memset(w, 0, sizeof(*w));
++    if (writer_reserve(w, FFSA_HEADER_SIZE) < 0)
++        return w->err;
++    w->buf[0] = FFSA_MAGIC0;
++    w->buf[1] = FFSA_MAGIC1;
++    w->buf[2] = FFSA_MAGIC2;
++    w->buf[3] = FFSA_MAGIC3;
++    w->buf[4] = FFSA_FORMAT_MAJOR;
++    w->buf[5] = FFSA_FORMAT_MINOR;
++    ff_ffsa_wr_u16be(w->buf + 6,  flags);
++    ff_ffsa_wr_u16be(w->buf + 8,  component_id);
++    ff_ffsa_wr_u16be(w->buf + 10, component_version);
++    ff_ffsa_wr_u32be(w->buf + 12, libav_version);
++    ff_ffsa_wr_u32be(w->buf + 16, build_hash);
++    ff_ffsa_wr_u64be(w->buf + 20, config_hash);
++    memset(w->buf + 28, 0, 8);
++    w->size = FFSA_HEADER_SIZE;
++    w->payload_start = FFSA_HEADER_SIZE;
++    w->atom_count = 0;
++    return 0;
++}
++
++int ff_ffsa_writer_add_atom(FFSAWriter *w,
++                            uint16_t type, uint16_t flags,
++                            const void *value, uint32_t length)
++{
++    uint32_t pad = (4 - (length & 3)) & 3;
++    if (w->err)
++        return w->err;
++    if (writer_reserve(w, (size_t)FFSA_ATOM_HEADER_SIZE + length + pad) < 0)
++        return w->err;
++    ff_ffsa_wr_u16be(w->buf + w->size, type);
++    ff_ffsa_wr_u16be(w->buf + w->size + 2, flags);
++    ff_ffsa_wr_u32be(w->buf + w->size + 4, length);
++    w->size += FFSA_ATOM_HEADER_SIZE;
++    if (length && value)
++        memcpy(w->buf + w->size, value, length);
++    w->size += length;
++    if (pad) {
++        memset(w->buf + w->size, 0, pad);
++        w->size += pad;
++    }
++    w->atom_count++;
++    return 0;
++}
++
++int ff_ffsa_writer_finish(FFSAWriter *w, uint8_t **out_buf, size_t *out_size)
++{
++    size_t payload_len;
++    uint32_t crc;
++    if (w->err)
++        return w->err;
++    payload_len = w->size - w->payload_start;
++    if (payload_len > 0xFFFFFFFFu) {
++        ff_ffsa_writer_abort(w);
++        return AVERROR(EINVAL);
++    }
++    ff_ffsa_wr_u16be(w->buf + 28, (uint16_t)w->atom_count);
++    ff_ffsa_wr_u16be(w->buf + 30, 0);
++    ff_ffsa_wr_u32be(w->buf + 32, (uint32_t)payload_len);
++
++    if (writer_reserve(w, FFSA_TRAILER_SIZE) < 0)
++        return w->err;
++    crc = ff_ffsa_crc32(w->buf + w->payload_start, payload_len);
++    ff_ffsa_wr_u32be(w->buf + w->size, crc);
++    w->size += FFSA_TRAILER_SIZE;
++
++    *out_buf = w->buf;
++    *out_size = w->size;
++    w->buf = NULL;
++    w->size = w->cap = 0;
++    return 0;
++}
++
++void ff_ffsa_writer_abort(FFSAWriter *w)
++{
++    av_freep(&w->buf);
++    w->size = w->cap = 0;
++    w->err = 0;
++    w->atom_count = 0;
++}
++
++int ff_ffsa_reader_validate(FFSAReader *r, const uint8_t *buf, size_t size)
++{
++    size_t off;
++    uint32_t crc, stored;
++    int i;
++
++    memset(r, 0, sizeof(*r));
++
++    if (size < FFSA_HEADER_SIZE + FFSA_TRAILER_SIZE)
++        return AVERROR(EINVAL);
++    if (buf[0] != FFSA_MAGIC0 || buf[1] != FFSA_MAGIC1 ||
++        buf[2] != FFSA_MAGIC2 || buf[3] != FFSA_MAGIC3)
++        return AVERROR(EINVAL);
++
++    r->header.format_major      = buf[4];
++    r->header.format_minor      = buf[5];
++    r->header.flags             = ff_ffsa_rd_u16be(buf + 6);
++    r->header.component_id      = ff_ffsa_rd_u16be(buf + 8);
++    r->header.component_version = ff_ffsa_rd_u16be(buf + 10);
++    r->header.libav_version     = ff_ffsa_rd_u32be(buf + 12);
++    r->header.build_hash        = ff_ffsa_rd_u32be(buf + 16);
++    r->header.config_hash       = ff_ffsa_rd_u64be(buf + 20);
++    r->header.atom_count        = ff_ffsa_rd_u16be(buf + 28);
++    r->header.payload_length    = ff_ffsa_rd_u32be(buf + 32);
++
++    if (r->header.format_major != FFSA_FORMAT_MAJOR)
++        return AVERROR(EINVAL);
++    if ((size_t)FFSA_HEADER_SIZE + r->header.payload_length +
++        FFSA_TRAILER_SIZE != size)
++        return AVERROR(EINVAL);
++
++    r->buf = buf;
++    r->size = size;
++    r->payload = buf + FFSA_HEADER_SIZE;
++    r->payload_len = r->header.payload_length;
++
++    stored = ff_ffsa_rd_u32be(buf + FFSA_HEADER_SIZE + r->payload_len);
++    crc = ff_ffsa_crc32(r->payload, r->payload_len);
++    if (crc != stored)
++        return AVERROR(EINVAL);
++
++    off = 0;
++    for (i = 0; i < r->header.atom_count; i++) {
++        uint32_t len, pad;
++        if (off + FFSA_ATOM_HEADER_SIZE > r->payload_len)
++            return AVERROR(EINVAL);
++        len = ff_ffsa_rd_u32be(r->payload + off + 4);
++        pad = (4 - (len & 3)) & 3;
++        if (off + FFSA_ATOM_HEADER_SIZE + len + pad > r->payload_len)
++            return AVERROR(EINVAL);
++        if (off + FFSA_ATOM_HEADER_SIZE + len + pad < off)
++            return AVERROR(EINVAL);
++        off += FFSA_ATOM_HEADER_SIZE + len + pad;
++    }
++    if (off != r->payload_len)
++        return AVERROR(EINVAL);
++
++    return 0;
++}
++
++int ff_ffsa_reader_find(const FFSAReader *r, uint16_t tag,
++                        const uint8_t **out_value, uint32_t *out_len)
++{
++    size_t off = 0;
++    int i;
++    for (i = 0; i < r->header.atom_count; i++) {
++        uint16_t t = ff_ffsa_rd_u16be(r->payload + off);
++        uint32_t len = ff_ffsa_rd_u32be(r->payload + off + 4);
++        uint32_t pad = (4 - (len & 3)) & 3;
++        if (t == tag) {
++            if (out_value) *out_value = r->payload + off + FFSA_ATOM_HEADER_SIZE;
++            if (out_len)   *out_len   = len;
++            return 1;
++        }
++        off += FFSA_ATOM_HEADER_SIZE + len + pad;
++    }
++    return 0;
++}
+diff --git a/libavfilter/state_format.h b/libavfilter/state_format.h
+new file mode 100644
+index 0000000..73321c4
+--- /dev/null
++++ b/libavfilter/state_format.h
+@@ -0,0 +1,150 @@
++/*
++ * FFSA — FFmpeg State Atoms binary format (v1.0)
++ * Private helpers for avfilter state serialisation.
++ *
++ * Duplicated from libavcodec/state_format.h so that libavfilter doesn't need
++ * a dependency on libavcodec. Must stay binary-compatible with the other
++ * copies in libavcodec and libswresample.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef AVFILTER_STATE_FORMAT_H
++#define AVFILTER_STATE_FORMAT_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#define FFSA_MAGIC0 0x46
++#define FFSA_MAGIC1 0x46
++#define FFSA_MAGIC2 0x53
++#define FFSA_MAGIC3 0x41
++#define FFSA_FORMAT_MAJOR 0x01
++#define FFSA_FORMAT_MINOR 0x00
++
++#define FFSA_FLAG_STRICT     (1u << 0)
++#define FFSA_FLAG_BITEXACT   (1u << 1)
++#define FFSA_FLAG_COMPRESSED (1u << 2)
++
++#define FFSA_ATOM_REQUIRED   (1u << 0)
++
++#define FFSA_COMPONENT_AAC_ENCODER 0x0001
++#define FFSA_COMPONENT_ARESAMPLE   0x0002
++#define FFSA_COMPONENT_AMIX        0x0003
++
++/* amix atom tags (component 0x0003) */
++#define FFSA_AMIX_INPUT_STATE         0x2001
++#define FFSA_AMIX_SCALE_NORM          0x2002
++#define FFSA_AMIX_NEXT_PTS            0x2003
++#define FFSA_AMIX_FRAME_LIST_HEADER   0x2004
++#define FFSA_AMIX_FRAME_LIST_ENTRIES  0x2005
++#define FFSA_AMIX_FIFO_SIZES          0x2006
++#define FFSA_AMIX_FIFO_DATA           0x2007
++
++#define FFSA_HEADER_SIZE 36
++#define FFSA_TRAILER_SIZE 4
++#define FFSA_ATOM_HEADER_SIZE 8
++
++typedef struct FFSAWriter {
++    uint8_t *buf;
++    size_t   size;
++    size_t   cap;
++    int      err;
++    int      atom_count;
++    size_t   payload_start;
++} FFSAWriter;
++
++int ff_ffsa_writer_begin(FFSAWriter *w,
++                         uint16_t component_id,
++                         uint16_t component_version,
++                         uint32_t libav_version,
++                         uint32_t build_hash,
++                         uint64_t config_hash,
++                         uint16_t flags);
++
++int ff_ffsa_writer_add_atom(FFSAWriter *w,
++                            uint16_t type, uint16_t flags,
++                            const void *value, uint32_t length);
++
++int ff_ffsa_writer_finish(FFSAWriter *w, uint8_t **out_buf, size_t *out_size);
++void ff_ffsa_writer_abort(FFSAWriter *w);
++
++typedef struct FFSAHeader {
++    uint8_t  format_major;
++    uint8_t  format_minor;
++    uint16_t flags;
++    uint16_t component_id;
++    uint16_t component_version;
++    uint32_t libav_version;
++    uint32_t build_hash;
++    uint64_t config_hash;
++    uint16_t atom_count;
++    uint32_t payload_length;
++} FFSAHeader;
++
++typedef struct FFSAReader {
++    const uint8_t *buf;
++    size_t         size;
++    FFSAHeader     header;
++    const uint8_t *payload;
++    size_t         payload_len;
++} FFSAReader;
++
++int ff_ffsa_reader_validate(FFSAReader *r, const uint8_t *buf, size_t size);
++int ff_ffsa_reader_find(const FFSAReader *r, uint16_t tag,
++                        const uint8_t **out_value, uint32_t *out_len);
++
++static inline void ff_ffsa_wr_u16be(uint8_t *p, uint16_t v)
++{
++    p[0] = (uint8_t)(v >> 8);
++    p[1] = (uint8_t)(v);
++}
++static inline void ff_ffsa_wr_u32be(uint8_t *p, uint32_t v)
++{
++    p[0] = (uint8_t)(v >> 24);
++    p[1] = (uint8_t)(v >> 16);
++    p[2] = (uint8_t)(v >> 8);
++    p[3] = (uint8_t)(v);
++}
++static inline void ff_ffsa_wr_u64be(uint8_t *p, uint64_t v)
++{
++    ff_ffsa_wr_u32be(p, (uint32_t)(v >> 32));
++    ff_ffsa_wr_u32be(p + 4, (uint32_t)v);
++}
++static inline uint16_t ff_ffsa_rd_u16be(const uint8_t *p)
++{
++    return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
++}
++static inline uint32_t ff_ffsa_rd_u32be(const uint8_t *p)
++{
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++           ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
++}
++static inline uint64_t ff_ffsa_rd_u64be(const uint8_t *p)
++{
++    return ((uint64_t)ff_ffsa_rd_u32be(p) << 32) |
++           (uint64_t)ff_ffsa_rd_u32be(p + 4);
++}
++
++static inline void ff_ffsa_wr_f32be(uint8_t *p, float v)
++{
++    union { float f; uint32_t u; } x;
++    x.f = v;
++    ff_ffsa_wr_u32be(p, x.u);
++}
++static inline float ff_ffsa_rd_f32be(const uint8_t *p)
++{
++    union { float f; uint32_t u; } x;
++    x.u = ff_ffsa_rd_u32be(p);
++    return x.f;
++}
++
++uint32_t ff_ffsa_crc32(const uint8_t *buf, size_t len);
++uint64_t ff_ffsa_sha256_prefix64(const uint8_t *buf, size_t len);
++
++#endif /* AVFILTER_STATE_FORMAT_H */

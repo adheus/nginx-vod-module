@@ -1,0 +1,863 @@
+diff --git a/libswresample/Makefile b/libswresample/Makefile
+index 8b9a0fe..4b8870c 100644
+--- a/libswresample/Makefile
++++ b/libswresample/Makefile
+@@ -12,8 +12,10 @@ OBJS = audioconvert.o                        \
+        rematrix.o                            \
+        resample.o                            \
+        resample_dsp.o                        \
++       state_format.o                        \
+        swresample.o                          \
+        swresample_frame.o                    \
++       swresample_state.o                    \
+        version.o                             \
+ 
+ OBJS-$(CONFIG_LIBSOXR) += soxr_resample.o
+diff --git a/libswresample/state_format.c b/libswresample/state_format.c
+new file mode 100644
+index 0000000..cc2fb73
+--- /dev/null
++++ b/libswresample/state_format.c
+@@ -0,0 +1,241 @@
++/*
++ * FFSA — FFmpeg State Atoms binary format (v1.0) — swresample copy.
++ *
++ * This file is identical in behaviour to libavcodec/state_format.c. A
++ * duplicate is used so that libswresample does not have to link against
++ * libavcodec. See libswresample/state_format.h for details.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <string.h>
++
++#include "libavutil/mem.h"
++#include "libavutil/error.h"
++#include "libavutil/crc.h"
++#include "libavutil/sha.h"
++
++#include "state_format.h"
++
++uint32_t ff_ffsa_crc32(const uint8_t *buf, size_t len)
++{
++    const AVCRC *t = av_crc_get_table(AV_CRC_32_IEEE_LE);
++    if (!t)
++        return 0;
++    return ~av_crc(t, 0xFFFFFFFFu, buf, len);
++}
++
++uint64_t ff_ffsa_sha256_prefix64(const uint8_t *buf, size_t len)
++{
++    struct AVSHA *ctx = av_sha_alloc();
++    uint8_t digest[32];
++    uint64_t out;
++    int i;
++
++    if (!ctx)
++        return 0;
++    av_sha_init(ctx, 256);
++    av_sha_update(ctx, buf, len);
++    av_sha_final(ctx, digest);
++    av_free(ctx);
++
++    out = 0;
++    for (i = 0; i < 8; i++)
++        out = (out << 8) | (uint64_t)digest[i];
++    return out;
++}
++
++static int writer_reserve(FFSAWriter *w, size_t extra)
++{
++    size_t need;
++    uint8_t *nb;
++    if (w->err)
++        return w->err;
++    need = w->size + extra;
++    if (need <= w->cap)
++        return 0;
++    while (w->cap < need)
++        w->cap = w->cap ? w->cap * 2 : 256;
++    nb = av_realloc(w->buf, w->cap);
++    if (!nb) {
++        w->err = AVERROR(ENOMEM);
++        return w->err;
++    }
++    w->buf = nb;
++    return 0;
++}
++
++int ff_ffsa_writer_begin(FFSAWriter *w,
++                         uint16_t component_id,
++                         uint16_t component_version,
++                         uint32_t libav_version,
++                         uint32_t build_hash,
++                         uint64_t config_hash,
++                         uint16_t flags)
++{
++    memset(w, 0, sizeof(*w));
++    if (writer_reserve(w, FFSA_HEADER_SIZE) < 0)
++        return w->err;
++    w->buf[0] = FFSA_MAGIC0;
++    w->buf[1] = FFSA_MAGIC1;
++    w->buf[2] = FFSA_MAGIC2;
++    w->buf[3] = FFSA_MAGIC3;
++    w->buf[4] = FFSA_FORMAT_MAJOR;
++    w->buf[5] = FFSA_FORMAT_MINOR;
++    ff_ffsa_wr_u16be(w->buf + 6,  flags);
++    ff_ffsa_wr_u16be(w->buf + 8,  component_id);
++    ff_ffsa_wr_u16be(w->buf + 10, component_version);
++    ff_ffsa_wr_u32be(w->buf + 12, libav_version);
++    ff_ffsa_wr_u32be(w->buf + 16, build_hash);
++    ff_ffsa_wr_u64be(w->buf + 20, config_hash);
++    memset(w->buf + 28, 0, 8);
++    w->size = FFSA_HEADER_SIZE;
++    w->payload_start = FFSA_HEADER_SIZE;
++    w->atom_count = 0;
++    return 0;
++}
++
++int ff_ffsa_writer_add_atom(FFSAWriter *w,
++                            uint16_t type, uint16_t flags,
++                            const void *value, uint32_t length)
++{
++    uint32_t pad = (4 - (length & 3)) & 3;
++    if (w->err)
++        return w->err;
++    if (writer_reserve(w, (size_t)FFSA_ATOM_HEADER_SIZE + length + pad) < 0)
++        return w->err;
++    ff_ffsa_wr_u16be(w->buf + w->size, type);
++    ff_ffsa_wr_u16be(w->buf + w->size + 2, flags);
++    ff_ffsa_wr_u32be(w->buf + w->size + 4, length);
++    w->size += FFSA_ATOM_HEADER_SIZE;
++    if (length && value)
++        memcpy(w->buf + w->size, value, length);
++    w->size += length;
++    if (pad) {
++        memset(w->buf + w->size, 0, pad);
++        w->size += pad;
++    }
++    w->atom_count++;
++    return 0;
++}
++
++int ff_ffsa_writer_finish(FFSAWriter *w, uint8_t **out_buf, size_t *out_size)
++{
++    size_t payload_len;
++    uint32_t crc;
++    if (w->err)
++        return w->err;
++    payload_len = w->size - w->payload_start;
++    if (payload_len > 0xFFFFFFFFu) {
++        ff_ffsa_writer_abort(w);
++        return AVERROR(EINVAL);
++    }
++    ff_ffsa_wr_u16be(w->buf + 28, (uint16_t)w->atom_count);
++    ff_ffsa_wr_u16be(w->buf + 30, 0);
++    ff_ffsa_wr_u32be(w->buf + 32, (uint32_t)payload_len);
++
++    if (writer_reserve(w, FFSA_TRAILER_SIZE) < 0)
++        return w->err;
++    crc = ff_ffsa_crc32(w->buf + w->payload_start, payload_len);
++    ff_ffsa_wr_u32be(w->buf + w->size, crc);
++    w->size += FFSA_TRAILER_SIZE;
++
++    *out_buf = w->buf;
++    *out_size = w->size;
++    w->buf = NULL;
++    w->size = w->cap = 0;
++    return 0;
++}
++
++void ff_ffsa_writer_abort(FFSAWriter *w)
++{
++    av_freep(&w->buf);
++    w->size = w->cap = 0;
++    w->err = 0;
++    w->atom_count = 0;
++}
++
++int ff_ffsa_reader_validate(FFSAReader *r, const uint8_t *buf, size_t size)
++{
++    size_t off;
++    uint32_t crc, stored;
++    int i;
++
++    memset(r, 0, sizeof(*r));
++
++    if (size < FFSA_HEADER_SIZE + FFSA_TRAILER_SIZE)
++        return AVERROR(EINVAL);
++    if (buf[0] != FFSA_MAGIC0 || buf[1] != FFSA_MAGIC1 ||
++        buf[2] != FFSA_MAGIC2 || buf[3] != FFSA_MAGIC3)
++        return AVERROR(EINVAL);
++
++    r->header.format_major      = buf[4];
++    r->header.format_minor      = buf[5];
++    r->header.flags             = ff_ffsa_rd_u16be(buf + 6);
++    r->header.component_id      = ff_ffsa_rd_u16be(buf + 8);
++    r->header.component_version = ff_ffsa_rd_u16be(buf + 10);
++    r->header.libav_version     = ff_ffsa_rd_u32be(buf + 12);
++    r->header.build_hash        = ff_ffsa_rd_u32be(buf + 16);
++    r->header.config_hash       = ff_ffsa_rd_u64be(buf + 20);
++    r->header.atom_count        = ff_ffsa_rd_u16be(buf + 28);
++    r->header.payload_length    = ff_ffsa_rd_u32be(buf + 32);
++
++    if (r->header.format_major != FFSA_FORMAT_MAJOR)
++        return AVERROR(EINVAL);
++
++    if ((size_t)FFSA_HEADER_SIZE + r->header.payload_length +
++        FFSA_TRAILER_SIZE != size)
++        return AVERROR(EINVAL);
++
++    r->buf = buf;
++    r->size = size;
++    r->payload = buf + FFSA_HEADER_SIZE;
++    r->payload_len = r->header.payload_length;
++
++    stored = ff_ffsa_rd_u32be(buf + FFSA_HEADER_SIZE + r->payload_len);
++    crc = ff_ffsa_crc32(r->payload, r->payload_len);
++    if (crc != stored)
++        return AVERROR(EINVAL);
++
++    off = 0;
++    for (i = 0; i < r->header.atom_count; i++) {
++        uint32_t len, pad;
++        if (off + FFSA_ATOM_HEADER_SIZE > r->payload_len)
++            return AVERROR(EINVAL);
++        len = ff_ffsa_rd_u32be(r->payload + off + 4);
++        pad = (4 - (len & 3)) & 3;
++        if (off + FFSA_ATOM_HEADER_SIZE + len + pad > r->payload_len)
++            return AVERROR(EINVAL);
++        if (off + FFSA_ATOM_HEADER_SIZE + len + pad < off)
++            return AVERROR(EINVAL);
++        off += FFSA_ATOM_HEADER_SIZE + len + pad;
++    }
++    if (off != r->payload_len)
++        return AVERROR(EINVAL);
++
++    return 0;
++}
++
++int ff_ffsa_reader_find(const FFSAReader *r, uint16_t tag,
++                        const uint8_t **out_value, uint32_t *out_len)
++{
++    size_t off = 0;
++    int i;
++    for (i = 0; i < r->header.atom_count; i++) {
++        uint16_t t = ff_ffsa_rd_u16be(r->payload + off);
++        uint32_t len = ff_ffsa_rd_u32be(r->payload + off + 4);
++        uint32_t pad = (4 - (len & 3)) & 3;
++        if (t == tag) {
++            if (out_value) *out_value = r->payload + off + FFSA_ATOM_HEADER_SIZE;
++            if (out_len)   *out_len   = len;
++            return 1;
++        }
++        off += FFSA_ATOM_HEADER_SIZE + len + pad;
++    }
++    return 0;
++}
+diff --git a/libswresample/state_format.h b/libswresample/state_format.h
+new file mode 100644
+index 0000000..3ac9f62
+--- /dev/null
++++ b/libswresample/state_format.h
+@@ -0,0 +1,158 @@
++/*
++ * FFSA — FFmpeg State Atoms binary format (v1.0)
++ * Private helpers for swresample / avfilter state serialisation.
++ *
++ * Duplicated from libavcodec/state_format.h so that libswresample and
++ * libavfilter can use the same wire format without introducing a new
++ * lib-to-lib dependency. The contents MUST stay in lockstep with
++ * libavcodec/state_format.{c,h} — matching header/atom formats is a
++ * hard requirement of the FFSA format.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef SWRESAMPLE_STATE_FORMAT_H
++#define SWRESAMPLE_STATE_FORMAT_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++/* Magic and version */
++#define FFSA_MAGIC0 0x46 /* 'F' */
++#define FFSA_MAGIC1 0x46 /* 'F' */
++#define FFSA_MAGIC2 0x53 /* 'S' */
++#define FFSA_MAGIC3 0x41 /* 'A' */
++#define FFSA_FORMAT_MAJOR 0x01
++#define FFSA_FORMAT_MINOR 0x00
++
++/* Header flags */
++#define FFSA_FLAG_STRICT     (1u << 0)
++#define FFSA_FLAG_BITEXACT   (1u << 1)
++#define FFSA_FLAG_COMPRESSED (1u << 2)
++
++/* Atom flags */
++#define FFSA_ATOM_REQUIRED   (1u << 0)
++
++/* Component IDs */
++#define FFSA_COMPONENT_AAC_ENCODER 0x0001
++#define FFSA_COMPONENT_ARESAMPLE   0x0002
++#define FFSA_COMPONENT_AMIX        0x0003
++
++/* swresample / aresample atom tags (component 0x0002) */
++#define FFSA_SWR_BUFFER_CURSORS     0x1001
++#define FFSA_SWR_IN_BUFFER          0x1002
++#define FFSA_SWR_PIPELINE_FLAGS     0x1003
++#define FFSA_SWR_PTS                0x1004
++#define FFSA_SWR_RESAMPLE_STATE     0x1005
++#define FFSA_SWR_DITHER_POS         0x1006
++#define FFSA_SWR_DITHER_NS_ERRORS   0x1007
++#define FFSA_ARESAMPLE_WRAPPER      0x1008
++
++/* Fixed sizes */
++#define FFSA_HEADER_SIZE 36
++#define FFSA_TRAILER_SIZE 4
++#define FFSA_ATOM_HEADER_SIZE 8
++
++typedef struct FFSAWriter {
++    uint8_t *buf;
++    size_t   size;
++    size_t   cap;
++    int      err;
++    int      atom_count;
++    size_t   payload_start;
++} FFSAWriter;
++
++int ff_ffsa_writer_begin(FFSAWriter *w,
++                         uint16_t component_id,
++                         uint16_t component_version,
++                         uint32_t libav_version,
++                         uint32_t build_hash,
++                         uint64_t config_hash,
++                         uint16_t flags);
++
++int ff_ffsa_writer_add_atom(FFSAWriter *w,
++                            uint16_t type, uint16_t flags,
++                            const void *value, uint32_t length);
++
++int ff_ffsa_writer_finish(FFSAWriter *w, uint8_t **out_buf, size_t *out_size);
++void ff_ffsa_writer_abort(FFSAWriter *w);
++
++typedef struct FFSAHeader {
++    uint8_t  format_major;
++    uint8_t  format_minor;
++    uint16_t flags;
++    uint16_t component_id;
++    uint16_t component_version;
++    uint32_t libav_version;
++    uint32_t build_hash;
++    uint64_t config_hash;
++    uint16_t atom_count;
++    uint32_t payload_length;
++} FFSAHeader;
++
++typedef struct FFSAReader {
++    const uint8_t *buf;
++    size_t         size;
++    FFSAHeader     header;
++    const uint8_t *payload;
++    size_t         payload_len;
++} FFSAReader;
++
++int ff_ffsa_reader_validate(FFSAReader *r, const uint8_t *buf, size_t size);
++int ff_ffsa_reader_find(const FFSAReader *r, uint16_t tag,
++                        const uint8_t **out_value, uint32_t *out_len);
++
++static inline void ff_ffsa_wr_u16be(uint8_t *p, uint16_t v)
++{
++    p[0] = (uint8_t)(v >> 8);
++    p[1] = (uint8_t)(v);
++}
++static inline void ff_ffsa_wr_u32be(uint8_t *p, uint32_t v)
++{
++    p[0] = (uint8_t)(v >> 24);
++    p[1] = (uint8_t)(v >> 16);
++    p[2] = (uint8_t)(v >> 8);
++    p[3] = (uint8_t)(v);
++}
++static inline void ff_ffsa_wr_u64be(uint8_t *p, uint64_t v)
++{
++    ff_ffsa_wr_u32be(p, (uint32_t)(v >> 32));
++    ff_ffsa_wr_u32be(p + 4, (uint32_t)v);
++}
++static inline uint16_t ff_ffsa_rd_u16be(const uint8_t *p)
++{
++    return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
++}
++static inline uint32_t ff_ffsa_rd_u32be(const uint8_t *p)
++{
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++           ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
++}
++static inline uint64_t ff_ffsa_rd_u64be(const uint8_t *p)
++{
++    return ((uint64_t)ff_ffsa_rd_u32be(p) << 32) |
++           (uint64_t)ff_ffsa_rd_u32be(p + 4);
++}
++
++static inline void ff_ffsa_wr_f32be(uint8_t *p, float v)
++{
++    union { float f; uint32_t u; } x;
++    x.f = v;
++    ff_ffsa_wr_u32be(p, x.u);
++}
++static inline float ff_ffsa_rd_f32be(const uint8_t *p)
++{
++    union { float f; uint32_t u; } x;
++    x.u = ff_ffsa_rd_u32be(p);
++    return x.f;
++}
++
++uint32_t ff_ffsa_crc32(const uint8_t *buf, size_t len);
++uint64_t ff_ffsa_sha256_prefix64(const uint8_t *buf, size_t len);
++
++#endif /* SWRESAMPLE_STATE_FORMAT_H */
+diff --git a/libswresample/swresample_state.c b/libswresample/swresample_state.c
+new file mode 100644
+index 0000000..94a2c90
+--- /dev/null
++++ b/libswresample/swresample_state.c
+@@ -0,0 +1,431 @@
++/*
++ * libswresample state snapshot/restore.
++ *
++ * Implements swr_get_state / swr_set_state for the SwrContext. Serialises
++ * the atoms documented in stateful-aac-validation/research/aresample-state.md
++ * into the FFSA wire format (state_format.c).
++ *
++ * Atom set (component 0x0002, component_version 0x0001):
++ *   0x1001 SWR_BUFFER_CURSORS       - in_buffer_index, in_buffer_count
++ *   0x1002 SWR_IN_BUFFER            - in_buffer contents, planar, BE bits
++ *   0x1003 SWR_PIPELINE_FLAGS       - resample_in_constraint, flushed
++ *   0x1004 SWR_PTS                  - outpts, firstpts, drop_output
++ *   0x1005 SWR_RESAMPLE_STATE       - index, frac, dst_incr,
++ *                                     compensation_distance, phase_count
++ *                                     (present iff s->resample != NULL)
++ *   0x1006 SWR_DITHER_POS           - noise_pos, ns_pos (iff dither active)
++ *   0x1007 SWR_DITHER_NS_ERRORS     - ns_errors (iff dither active)
++ *
++ * The ARESAMPLE_WRAPPER (0x1008) atom is owned by libavfilter's aresample
++ * state getter; it is NOT written here.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <string.h>
++
++#include "libavutil/mem.h"
++#include "libavutil/error.h"
++#include "libavutil/samplefmt.h"
++
++#include "swresample.h"
++#include "swresample_internal.h"
++#include "resample.h"
++#include "version.h"
++#include "state_format.h"
++
++#define SWR_COMPONENT_VERSION 0x0001
++
++/* --------------------------------------------------------- config hash -- */
++
++static uint64_t compute_config_hash(const SwrContext *s)
++{
++    uint8_t buf[256];
++    size_t off = 0;
++    uint64_t in_mask = 0, out_mask = 0;
++    union { double d; uint64_t u; } dbits;
++
++    ff_ffsa_wr_u32be(buf + off, FFSA_COMPONENT_ARESAMPLE); off += 4;
++    ff_ffsa_wr_u32be(buf + off, SWR_COMPONENT_VERSION);   off += 4;
++
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->in_sample_rate);  off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->out_sample_rate); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->in_sample_fmt);   off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->out_sample_fmt);  off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->int_sample_fmt);  off += 4;
++
++    if (s->in_ch_layout.order == AV_CHANNEL_ORDER_NATIVE)
++        in_mask = s->in_ch_layout.u.mask;
++    if (s->out_ch_layout.order == AV_CHANNEL_ORDER_NATIVE)
++        out_mask = s->out_ch_layout.u.mask;
++    ff_ffsa_wr_u64be(buf + off, in_mask);  off += 8;
++    ff_ffsa_wr_u64be(buf + off, out_mask); off += 8;
++
++    /* Also lock channel counts in case of custom layouts */
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->in_ch_layout.nb_channels);  off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->out_ch_layout.nb_channels); off += 4;
++
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->flags);          off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->filter_size);    off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->phase_shift);    off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->linear_interp);  off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->exact_rational); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->filter_type);    off += 4;
++
++    dbits.d = s->kaiser_beta;
++    ff_ffsa_wr_u64be(buf + off, dbits.u); off += 8;
++    dbits.d = s->precision;
++    ff_ffsa_wr_u64be(buf + off, dbits.u); off += 8;
++
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->dither.method); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)s->engine);        off += 4;
++
++    return ff_ffsa_sha256_prefix64(buf, off);
++}
++
++static uint32_t compute_build_hash(void)
++{
++    const char *ident = av_version_info();
++    if (!ident)
++        return 0;
++    return ff_ffsa_crc32((const uint8_t *)ident, strlen(ident));
++}
++
++/* Is dither active (meaningful state beyond config)? Mirrors swri_dither_init. */
++static int dither_active(const SwrContext *s)
++{
++    /* noise shaping and plain rectangular / triangular PRNG both use noise_pos
++     * so long as scale != 0. Non-SWR_DITHER_NONE with non-zero scale is the
++     * condition to serialise. */
++    if (s->dither.method == SWR_DITHER_NONE)
++        return 0;
++    if (s->dither.scale == 0.0f)
++        return 0;
++    return 1;
++}
++
++/* --------------------------------------------------------------- API --- */
++
++int swr_get_state(struct SwrContext *s, uint8_t **out_buf, size_t *out_size)
++{
++    FFSAWriter w;
++    uint8_t tmp[32];
++    int ret;
++    int bps;
++    int nb_channels;
++
++    if (!s || !out_buf || !out_size)
++        return AVERROR(EINVAL);
++    *out_buf = NULL;
++    *out_size = 0;
++    if (!swr_is_initialized(s))
++        return AVERROR(EINVAL);
++
++    bps = av_get_bytes_per_sample(s->int_sample_fmt);
++    if (bps <= 0)
++        return AVERROR(EINVAL);
++    nb_channels = s->in_buffer.ch_count;
++    if (nb_channels <= 0)
++        nb_channels = s->used_ch_layout.nb_channels;
++
++    ret = ff_ffsa_writer_begin(&w,
++                               FFSA_COMPONENT_ARESAMPLE,
++                               SWR_COMPONENT_VERSION,
++                               LIBSWRESAMPLE_VERSION_INT,
++                               compute_build_hash(),
++                               compute_config_hash(s),
++                               0);
++    if (ret < 0)
++        return ret;
++
++    /* 0x1001 SWR_BUFFER_CURSORS */
++    ff_ffsa_wr_u32be(tmp + 0, (uint32_t)s->in_buffer_index);
++    ff_ffsa_wr_u32be(tmp + 4, (uint32_t)s->in_buffer_count);
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_SWR_BUFFER_CURSORS,
++                                  FFSA_ATOM_REQUIRED, tmp, 8);
++    if (ret < 0) goto fail;
++
++    /* 0x1002 SWR_IN_BUFFER — planar per channel in int_sample_fmt. Big-endian
++     * bit pattern to match FFSA conventions. We dump exactly in_buffer_count
++     * samples per channel starting at in_buffer_index. */
++    {
++        uint32_t total = (uint32_t)s->in_buffer_count * (uint32_t)bps *
++                         (uint32_t)nb_channels;
++        uint8_t *payload = total ? av_malloc(total) : NULL;
++        if (total && !payload) { ret = AVERROR(ENOMEM); goto fail; }
++        if (total) {
++            int ch;
++            int samples = s->in_buffer_count;
++            for (ch = 0; ch < nb_channels; ch++) {
++                const uint8_t *src = s->in_buffer.ch[ch] +
++                                     (size_t)s->in_buffer_index * bps;
++                uint8_t *dst = payload + (size_t)ch * samples * bps;
++                int i;
++                if (bps == 4) {
++                    for (i = 0; i < samples; i++) {
++                        uint32_t v;
++                        memcpy(&v, src + i * 4, 4);
++                        ff_ffsa_wr_u32be(dst + i * 4, v);
++                    }
++                } else if (bps == 8) {
++                    for (i = 0; i < samples; i++) {
++                        uint64_t v;
++                        memcpy(&v, src + i * 8, 8);
++                        ff_ffsa_wr_u64be(dst + i * 8, v);
++                    }
++                } else if (bps == 2) {
++                    for (i = 0; i < samples; i++) {
++                        uint16_t v;
++                        memcpy(&v, src + i * 2, 2);
++                        ff_ffsa_wr_u16be(dst + i * 2, v);
++                    }
++                } else {
++                    /* s32p is bps=4; s16p is bps=2; fltp=4; dblp=8 — all covered.
++                     * Any other internal fmt isn't supported upstream by swr. */
++                    av_free(payload);
++                    ret = AVERROR(EINVAL);
++                    goto fail;
++                }
++            }
++        }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_SWR_IN_BUFFER,
++                                      FFSA_ATOM_REQUIRED, payload, total);
++        av_free(payload);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x1003 SWR_PIPELINE_FLAGS */
++    ff_ffsa_wr_u32be(tmp + 0, (uint32_t)s->resample_in_constraint);
++    ff_ffsa_wr_u32be(tmp + 4, (uint32_t)s->flushed);
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_SWR_PIPELINE_FLAGS,
++                                  FFSA_ATOM_REQUIRED, tmp, 8);
++    if (ret < 0) goto fail;
++
++    /* 0x1004 SWR_PTS */
++    ff_ffsa_wr_u64be(tmp + 0,  (uint64_t)s->outpts);
++    ff_ffsa_wr_u64be(tmp + 8,  (uint64_t)s->firstpts);
++    ff_ffsa_wr_u32be(tmp + 16, (uint32_t)s->drop_output);
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_SWR_PTS,
++                                  FFSA_ATOM_REQUIRED, tmp, 20);
++    if (ret < 0) goto fail;
++
++    /* 0x1005 SWR_RESAMPLE_STATE — iff resampler is active */
++    if (s->resample) {
++        ff_ffsa_wr_u32be(tmp + 0,  (uint32_t)s->resample->index);
++        ff_ffsa_wr_u32be(tmp + 4,  (uint32_t)s->resample->frac);
++        ff_ffsa_wr_u32be(tmp + 8,  (uint32_t)s->resample->dst_incr);
++        ff_ffsa_wr_u32be(tmp + 12, (uint32_t)s->resample->compensation_distance);
++        ff_ffsa_wr_u32be(tmp + 16, (uint32_t)s->resample->phase_count);
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_SWR_RESAMPLE_STATE,
++                                      FFSA_ATOM_REQUIRED, tmp, 20);
++        if (ret < 0) goto fail;
++    }
++
++    /* 0x1006/0x1007 dither — only if active */
++    if (dither_active(s)) {
++        ff_ffsa_wr_u32be(tmp + 0, (uint32_t)s->dither.noise_pos);
++        ff_ffsa_wr_u32be(tmp + 4, (uint32_t)s->dither.ns_pos);
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_SWR_DITHER_POS,
++                                      FFSA_ATOM_REQUIRED, tmp, 8);
++        if (ret < 0) goto fail;
++
++        {
++            /* ns_errors is [SWR_CH_MAX][2*NS_TAPS] but we only need nb_channels
++             * rows * 40 cells = nb_channels * 160 bytes. */
++            int rows = nb_channels;
++            uint32_t total = (uint32_t)rows * 2 * NS_TAPS * 4;
++            uint8_t *payload = av_malloc(total);
++            int ch, k;
++            if (!payload) { ret = AVERROR(ENOMEM); goto fail; }
++            for (ch = 0; ch < rows; ch++) {
++                uint8_t *dst = payload + (size_t)ch * 2 * NS_TAPS * 4;
++                for (k = 0; k < 2 * NS_TAPS; k++)
++                    ff_ffsa_wr_f32be(dst + k * 4, s->dither.ns_errors[ch][k]);
++            }
++            ret = ff_ffsa_writer_add_atom(&w, FFSA_SWR_DITHER_NS_ERRORS,
++                                          FFSA_ATOM_REQUIRED, payload, total);
++            av_free(payload);
++            if (ret < 0) goto fail;
++        }
++    }
++
++    ret = ff_ffsa_writer_finish(&w, out_buf, out_size);
++    if (ret < 0)
++        goto fail;
++    return 0;
++
++fail:
++    ff_ffsa_writer_abort(&w);
++    *out_buf = NULL;
++    *out_size = 0;
++    return ret;
++}
++
++int swr_set_state(struct SwrContext *s, const uint8_t *buf, size_t size)
++{
++    FFSAReader r;
++    const uint8_t *val;
++    uint32_t vlen;
++    int ret;
++    int bps;
++    int nb_channels;
++    int has_resample_atom;
++
++    if (!s || !buf || !size)
++        return AVERROR(EINVAL);
++    if (!swr_is_initialized(s))
++        return AVERROR(EINVAL);
++
++    ret = ff_ffsa_reader_validate(&r, buf, size);
++    if (ret < 0)
++        return ret;
++    if (r.header.component_id != FFSA_COMPONENT_ARESAMPLE)
++        return AVERROR(EINVAL);
++    if (r.header.component_version != SWR_COMPONENT_VERSION)
++        return AVERROR(EINVAL);
++    if (r.header.config_hash != compute_config_hash(s))
++        return AVERROR(EINVAL);
++
++    bps = av_get_bytes_per_sample(s->int_sample_fmt);
++    if (bps <= 0)
++        return AVERROR(EINVAL);
++    nb_channels = s->in_buffer.ch_count;
++    if (nb_channels <= 0)
++        nb_channels = s->used_ch_layout.nb_channels;
++
++    /* pass 1: sizing checks that can fail */
++    if (!ff_ffsa_reader_find(&r, FFSA_SWR_BUFFER_CURSORS, &val, &vlen) || vlen != 8)
++        return AVERROR(EINVAL);
++    {
++        int idx = (int32_t)ff_ffsa_rd_u32be(val + 0);
++        int cnt = (int32_t)ff_ffsa_rd_u32be(val + 4);
++        if (idx < 0 || cnt < 0)
++            return AVERROR(EINVAL);
++        if (!ff_ffsa_reader_find(&r, FFSA_SWR_IN_BUFFER, &val, &vlen))
++            return AVERROR(EINVAL);
++        if (vlen != (uint32_t)cnt * bps * nb_channels)
++            return AVERROR(EINVAL);
++    }
++    if (!ff_ffsa_reader_find(&r, FFSA_SWR_PIPELINE_FLAGS, &val, &vlen) || vlen != 8)
++        return AVERROR(EINVAL);
++    if (!ff_ffsa_reader_find(&r, FFSA_SWR_PTS, &val, &vlen) || vlen != 20)
++        return AVERROR(EINVAL);
++
++    has_resample_atom = ff_ffsa_reader_find(&r, FFSA_SWR_RESAMPLE_STATE, &val, &vlen);
++    if (has_resample_atom && vlen != 20)
++        return AVERROR(EINVAL);
++    if (s->resample && !has_resample_atom)
++        return AVERROR(EINVAL);
++    if (!s->resample && has_resample_atom)
++        /* Config says no resampler, but blob has one. Treat as config mismatch. */
++        return AVERROR(EINVAL);
++
++    if (dither_active(s)) {
++        if (!ff_ffsa_reader_find(&r, FFSA_SWR_DITHER_POS, &val, &vlen) || vlen != 8)
++            return AVERROR(EINVAL);
++        if (!ff_ffsa_reader_find(&r, FFSA_SWR_DITHER_NS_ERRORS, &val, &vlen) ||
++            vlen != (uint32_t)nb_channels * 2 * NS_TAPS * 4)
++            return AVERROR(EINVAL);
++    }
++
++    /* pass 2: apply */
++
++    /* in_buffer cursors & contents come first — we need to resize in_buffer
++     * before we can copy into it. */
++    ff_ffsa_reader_find(&r, FFSA_SWR_BUFFER_CURSORS, &val, &vlen);
++    {
++        int idx = (int32_t)ff_ffsa_rd_u32be(val + 0);
++        int cnt = (int32_t)ff_ffsa_rd_u32be(val + 4);
++        const uint8_t *data;
++        int need;
++        int ch, i;
++
++        ff_ffsa_reader_find(&r, FFSA_SWR_IN_BUFFER, &data, &vlen);
++        need = idx + cnt;
++        /* in_buffer.ch_count has been set by swr_init; make sure storage is
++         * large enough for the saved content. Use swri_realloc_audio, which
++         * grows but does not shrink. */
++        if (need > s->in_buffer.count) {
++            int r2 = swri_realloc_audio(&s->in_buffer, need);
++            if (r2 < 0)
++                return r2;
++        }
++        /* Clear the region we're about to write (paranoia: keeps the
++         * pre-index slot deterministic in case any downstream path touches
++         * it — e.g. the copy() path in resample() at line 559). */
++        for (ch = 0; ch < nb_channels; ch++) {
++            memset(s->in_buffer.ch[ch], 0, (size_t)s->in_buffer.count * bps);
++        }
++        for (ch = 0; ch < nb_channels; ch++) {
++            uint8_t *dst = s->in_buffer.ch[ch] + (size_t)idx * bps;
++            const uint8_t *src = data + (size_t)ch * cnt * bps;
++            if (bps == 4) {
++                for (i = 0; i < cnt; i++) {
++                    uint32_t v = ff_ffsa_rd_u32be(src + i * 4);
++                    memcpy(dst + i * 4, &v, 4);
++                }
++            } else if (bps == 8) {
++                for (i = 0; i < cnt; i++) {
++                    uint64_t v = ff_ffsa_rd_u64be(src + i * 8);
++                    memcpy(dst + i * 8, &v, 8);
++                }
++            } else { /* bps == 2 */
++                for (i = 0; i < cnt; i++) {
++                    uint16_t v = ff_ffsa_rd_u16be(src + i * 2);
++                    memcpy(dst + i * 2, &v, 2);
++                }
++            }
++        }
++        s->in_buffer_index = idx;
++        s->in_buffer_count = cnt;
++    }
++
++    ff_ffsa_reader_find(&r, FFSA_SWR_PIPELINE_FLAGS, &val, &vlen);
++    s->resample_in_constraint = (int32_t)ff_ffsa_rd_u32be(val + 0);
++    s->flushed                = (int32_t)ff_ffsa_rd_u32be(val + 4);
++
++    ff_ffsa_reader_find(&r, FFSA_SWR_PTS, &val, &vlen);
++    s->outpts      = (int64_t)ff_ffsa_rd_u64be(val + 0);
++    s->firstpts    = (int64_t)ff_ffsa_rd_u64be(val + 8);
++    s->drop_output = (int32_t)ff_ffsa_rd_u32be(val + 16);
++
++    if (s->resample) {
++        ff_ffsa_reader_find(&r, FFSA_SWR_RESAMPLE_STATE, &val, &vlen);
++        s->resample->index                 = (int32_t)ff_ffsa_rd_u32be(val + 0);
++        s->resample->frac                  = (int32_t)ff_ffsa_rd_u32be(val + 4);
++        s->resample->dst_incr              = (int32_t)ff_ffsa_rd_u32be(val + 8);
++        s->resample->compensation_distance = (int32_t)ff_ffsa_rd_u32be(val + 12);
++        s->resample->phase_count           = (int32_t)ff_ffsa_rd_u32be(val + 16);
++        /* dst_incr_div/mod are derived from dst_incr / src_incr. Re-derive so
++         * that the restored context is self-consistent the way it would have
++         * been after a set_compensation call at the same point in time. */
++        if (s->resample->src_incr > 0) {
++            s->resample->dst_incr_div = s->resample->dst_incr / s->resample->src_incr;
++            s->resample->dst_incr_mod = s->resample->dst_incr % s->resample->src_incr;
++        }
++    }
++
++    if (dither_active(s)) {
++        ff_ffsa_reader_find(&r, FFSA_SWR_DITHER_POS, &val, &vlen);
++        s->dither.noise_pos = (int32_t)ff_ffsa_rd_u32be(val + 0);
++        s->dither.ns_pos    = (int32_t)ff_ffsa_rd_u32be(val + 4);
++
++        ff_ffsa_reader_find(&r, FFSA_SWR_DITHER_NS_ERRORS, &val, &vlen);
++        {
++            int rows = nb_channels;
++            int ch, k;
++            for (ch = 0; ch < rows; ch++) {
++                const uint8_t *src = val + (size_t)ch * 2 * NS_TAPS * 4;
++                for (k = 0; k < 2 * NS_TAPS; k++)
++                    s->dither.ns_errors[ch][k] = ff_ffsa_rd_f32be(src + k * 4);
++            }
++        }
++    }
++
++    return 0;
++}

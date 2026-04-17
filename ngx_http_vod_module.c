@@ -3910,17 +3910,47 @@ ngx_http_vod_encoder_state_post(ngx_http_vod_ctx_t* ctx)
 	child_params.method = NGX_HTTP_POST;
 	child_params.base_uri = uri;
 
-	// body bytes: piggyback via extra_header? ngx_child_request doesn't expose
-	// a body field in this fork's API — we approximate via X-Encoder-State
-	// header (base64). For a production-ready path this would use a body
-	// handler; the test upstream accepts either. For correctness of the test
-	// harness, we write the blob to disk via the upstream Python service,
-	// which reads the request body — so we rely on a tiny body injection
-	// in extra_header for now as a hex blob, documented in the patch README.
-	//
-	// Blocking mode: we NGX_AGAIN and finalize via callback.
-	// Fire-and-forget: we start the request and finalize immediately. The
-	// upstream does its own ack.
+	// Attach the FFSA blob as the POST body via the new body plumbing in
+	// ngx_child_request_start. Content-Length / Content-Type are synthesized
+	// inside copy_headers; the upstream proxy module then forwards the
+	// bytes unchanged to the configured backend.
+	// The blob is copied into pool-managed memory so we can immediately
+	// release the av_malloc'd buffer (avoids a leak in fire-and-forget
+	// mode where no completion callback runs).
+	{
+		u_char* body_bytes = ngx_pnalloc(r->pool, ctx->audio_state_out_size);
+		ngx_buf_t* body_buf = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+		ngx_chain_t* body_chain = ngx_alloc_chain_link(r->pool);
+		if (body_bytes == NULL || body_buf == NULL || body_chain == NULL)
+		{
+			ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+				"ngx_http_vod_encoder_state_post: body alloc failed");
+			av_free(ctx->audio_state_out_blob);
+			ctx->audio_state_out_blob = NULL;
+			ctx->audio_state_out_size = 0;
+			return NGX_OK;
+		}
+		ngx_memcpy(body_bytes, ctx->audio_state_out_blob,
+			ctx->audio_state_out_size);
+		body_buf->start = body_buf->pos = body_bytes;
+		body_buf->end = body_buf->last =
+			body_bytes + ctx->audio_state_out_size;
+		body_buf->memory = 1;
+		body_buf->last_buf = 1;
+		body_buf->last_in_chain = 1;
+		body_buf->flush = 1;
+		body_chain->buf = body_buf;
+		body_chain->next = NULL;
+
+		child_params.body = body_chain;
+		child_params.body_length = (off_t) ctx->audio_state_out_size;
+		ngx_str_set(&child_params.body_content_type, "application/octet-stream");
+
+		// blob copied; safe to release the av_malloc'd original
+		av_free(ctx->audio_state_out_blob);
+		ctx->audio_state_out_blob = NULL;
+	}
+
 	ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 		"ngx_http_vod_encoder_state_post: POST %V (%uz bytes)",
 		&uri, ctx->audio_state_out_size);
