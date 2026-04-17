@@ -6,6 +6,7 @@
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersrc.h>
 #include <libavfilter/buffersink.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
 #include "audio_encoder.h"
 #include "audio_decoder.h"
@@ -366,17 +367,110 @@ audio_filter_init_sink(
 	uint64_t channel_layout,
 	uint32_t sample_rate,
 	const u_char* sink_name,
-	audio_filter_sink_t* sink, 
+	audio_filter_sink_t* sink,
 	AVFilterInOut** inputs)
 {
 	AVFilterInOut* input_link;
-	enum AVSampleFormat out_sample_fmts[2];
-	int64_t out_channel_layouts[2];
-	int out_sample_rates[2];
 	int avrc;
 
 	// Note: matching the output to some reference track, may need to change in the future
 	//		if filters such as 'join' will be added
+
+	// Modern libavutil (>= 59.36.100 / FFmpeg 7.1) enforces
+	// AV_OPT_FLAG_RUNTIME_PARAM on post-init av_opt_set_*; abuffersink's
+	// format options don't carry that flag, so the legacy sequence of
+	// avfilter_graph_create_filter() followed by av_opt_set_int_list() now
+	// returns -22 (AVERROR(EINVAL)). The portable fix is to split creation
+	// from initialization: allocate with avfilter_graph_alloc_filter(), set
+	// the options (pre-init), then call avfilter_init_dict().
+	//
+	// Name changes are also necessary — the old BINARY-typed
+	// "sample_fmts"/"sample_rates" options plus the string-typed
+	// "ch_layouts" option were replaced by ARRAY-typed "sample_formats",
+	// "samplerates", and "channel_layouts" in the same release. The
+	// deprecated names still exist behind FF_API_BUFFERSINK_OPTS on builds
+	// where that knob is defined, but relying on them would regress again
+	// as soon as the define flips off. So the modern branch below speaks
+	// the new option vocabulary exclusively.
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 36, 100)
+	enum AVSampleFormat out_sample_fmt = sink->encoder->format;
+	int out_sample_rate = (int)sample_rate;
+	AVChannelLayout out_ch_layout;
+
+	sink->buffer_sink = avfilter_graph_alloc_filter(
+		filter_graph,
+		buffersink_filter,
+		(const char*)sink_name);
+	if (sink->buffer_sink == NULL)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"audio_filter_init_sink: avfilter_graph_alloc_filter failed");
+		return VOD_ALLOC_FAILED;
+	}
+
+	avrc = av_opt_set_array(
+		sink->buffer_sink,
+		"sample_formats",
+		AV_OPT_SEARCH_CHILDREN,
+		0, 1,
+		AV_OPT_TYPE_SAMPLE_FMT,
+		&out_sample_fmt);
+	if (avrc < 0)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"audio_filter_init_sink: av_opt_set_array(sample_formats) failed %d", avrc);
+		return VOD_UNEXPECTED;
+	}
+
+	avrc = av_opt_set_array(
+		sink->buffer_sink,
+		"samplerates",
+		AV_OPT_SEARCH_CHILDREN,
+		0, 1,
+		AV_OPT_TYPE_INT,
+		&out_sample_rate);
+	if (avrc < 0)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"audio_filter_init_sink: av_opt_set_array(samplerates) failed %d", avrc);
+		return VOD_UNEXPECTED;
+	}
+
+	avrc = av_channel_layout_from_mask(&out_ch_layout, channel_layout);
+	if (avrc < 0)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"audio_filter_init_sink: av_channel_layout_from_mask(0x%uxL) failed %d",
+			channel_layout, avrc);
+		return VOD_UNEXPECTED;
+	}
+
+	avrc = av_opt_set_array(
+		sink->buffer_sink,
+		"channel_layouts",
+		AV_OPT_SEARCH_CHILDREN,
+		0, 1,
+		AV_OPT_TYPE_CHLAYOUT,
+		&out_ch_layout);
+	av_channel_layout_uninit(&out_ch_layout);
+	if (avrc < 0)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"audio_filter_init_sink: av_opt_set_array(channel_layouts) failed %d", avrc);
+		return VOD_UNEXPECTED;
+	}
+
+	avrc = avfilter_init_dict(sink->buffer_sink, NULL);
+	if (avrc < 0)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"audio_filter_init_sink: avfilter_init_dict failed %d", avrc);
+		return VOD_UNEXPECTED;
+	}
+#else
+	enum AVSampleFormat out_sample_fmts[2];
+	int64_t out_channel_layouts[2];
+	int out_sample_rates[2];
 
 	// create the buffer sink
 	avrc = avfilter_graph_create_filter(
@@ -438,6 +532,7 @@ audio_filter_init_sink(
 			"audio_filter_init_sink: av_opt_set_int_list(sample rates) failed %d", avrc);
 		return VOD_UNEXPECTED;
 	}
+#endif
 
 	// add to the inputs list
 	input_link = avfilter_inout_alloc();
