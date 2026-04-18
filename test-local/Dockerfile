@@ -31,6 +31,7 @@ COPY test-local/ffmpeg-patches/0001-state-format-framework.patch \
      test-local/ffmpeg-patches/0004-swresample-state.patch \
      test-local/ffmpeg-patches/0005-avfilter-amix-state.patch \
      test-local/ffmpeg-patches/0006-swr-amix-public-api.patch \
+     test-local/ffmpeg-patches/0007-avfilter-aresample-state-route.patch \
      /tmp/ffmpeg-patches/
 RUN cd /tmp/ffmpeg && \
     patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0001-state-format-framework.patch && \
@@ -38,7 +39,8 @@ RUN cd /tmp/ffmpeg && \
     patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0005-avfilter-amix-state.patch && \
     patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0006-swr-amix-public-api.patch && \
     patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0004-swresample-state.patch && \
-    patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0003-public-api.patch
+    patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0003-public-api.patch && \
+    patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0007-avfilter-aresample-state-route.patch
 
 # Minimal build — native AAC encoder only (no libfdk_aac). Mirrors the subset
 # that nginx-vod-module actually needs for HLS audio muxing.
@@ -173,7 +175,12 @@ RUN mkdir -p /var/log/nginx /var/cache/nginx /web/content
 COPY test-local/nginx.conf /usr/local/nginx/conf/nginx.conf
 COPY test-local/media/ /web/content/
 COPY test-local/mapping.py /web/mapping.py
+COPY test-local/state_server.py /web/state_server.py
+COPY test-local/test_player.html /web/test/test_player.html
+RUN mkdir -p /tmp/state-blobs
 
 EXPOSE 8080
 
-CMD python3 /web/mapping.py & /usr/local/nginx/sbin/nginx -g "daemon off;"
+# Start both the mapping server (port 8888) and the state-upstream server
+# (port 8889) alongside nginx.
+CMD python3 /web/mapping.py & python3 /web/state_server.py & /usr/local/nginx/sbin/nginx -g "daemon off;"

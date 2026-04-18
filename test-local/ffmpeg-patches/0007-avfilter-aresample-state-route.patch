@@ -1,0 +1,110 @@
+From: stateful-audio <noreply@moises>
+Date: 2026-04-16
+Subject: [PATCH 0007] avfilter: route aresample filter state through
+ swr_{get,set}_state
+
+Extends avfilter_get_filter_state / avfilter_set_filter_state (added in
+0006) to also recognise the "aresample" filter. Internally, the helper
+reaches the filter's private AResampleContext (via a tiny accessor
+exported from af_aresample.c) and forwards to swr_get_state /
+swr_set_state, so the blob component_id is 0x0002 (FFSA_COMPONENT_ARESAMPLE)
+just as it would be for a bare SwrContext.
+
+This lets callers snapshot the full audio filter graph state uniformly
+through a single API, avoiding having to know which filter wraps a
+SwrContext.
+
+No public API change in this patch; only widens which filters the
+already-declared avfilter_get_filter_state / avfilter_set_filter_state
+accept.
+
+---
+ libavfilter/af_aresample.c | 16 ++++++++++++++++
+ libavfilter/avfilter.c     | 32 ++++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+
+diff --git a/libavfilter/af_aresample.c b/libavfilter/af_aresample.c
+--- a/libavfilter/af_aresample.c
++++ b/libavfilter/af_aresample.c
+@@ -43,6 +43,22 @@ typedef struct AResampleContext {
+     int more_data;
+ } AResampleContext;
+
++/* ----------------------------------------- stateful-audio internal API --
++ *
++ * Accessor used by libavfilter/avfilter.c (avfilter_{get,set}_filter_state)
++ * to reach the underlying SwrContext without leaking the private
++ * AResampleContext layout outside this translation unit. Keeping the
++ * accessor here means any future AResampleContext layout change is
++ * isolated.
++ */
++struct SwrContext *ff_aresample_get_swr(AVFilterContext *ctx);
++
++struct SwrContext *ff_aresample_get_swr(AVFilterContext *ctx)
++{
++    AResampleContext *aresample = ctx ? (AResampleContext *)ctx->priv : NULL;
++    return aresample ? aresample->swr : NULL;
++}
++
+ static av_cold int preinit(AVFilterContext *ctx)
+ {
+     AResampleContext *aresample = ctx->priv;
+diff --git a/libavfilter/avfilter.c b/libavfilter/avfilter.c
+--- a/libavfilter/avfilter.c
++++ b/libavfilter/avfilter.c
+@@ -47,10 +47,18 @@
+ #include "framepool.h"
+ #include "video.h"
+
+ #if CONFIG_AMIX_FILTER
+ #include "af_amix_state.h"
+ #endif
+
++#if CONFIG_ARESAMPLE_FILTER
++#include "libswresample/swresample.h"
++/* Provided by libavfilter/af_aresample.c. Declared locally so we do not
++ * have to pollute a public header with what is effectively an
++ * implementation detail bridging avfilter and swresample. */
++struct SwrContext *ff_aresample_get_swr(AVFilterContext *ctx);
++#endif
++
+ static void tlog_ref(void *ctx, AVFrame *ref, int end)
+ {
+ #ifdef TRACE
+@@ -1024,6 +1032,18 @@ int avfilter_get_filter_state(AVFilterContext *ctx,
+ #if CONFIG_AMIX_FILTER
+     if (!strcmp(ctx->filter->name, "amix"))
+         return ff_amix_get_state(ctx, buf, size);
+ #endif
++#if CONFIG_ARESAMPLE_FILTER
++    if (!strcmp(ctx->filter->name, "aresample")) {
++        struct SwrContext *swr = ff_aresample_get_swr(ctx);
++        if (!swr) {
++            *buf = NULL;
++            *size = 0;
++            return AVERROR(EINVAL);
++        }
++        /* Produces an FFSA blob with component_id = 0x0002 (ARESAMPLE). */
++        return swr_get_state(swr, buf, size);
++    }
++#endif
+     return AVERROR(ENOSYS);
+ }
+
+@@ -1039,6 +1059,18 @@ int avfilter_set_filter_state(AVFilterContext *ctx,
+ #if CONFIG_AMIX_FILTER
+     if (!strcmp(ctx->filter->name, "amix"))
+         return ff_amix_set_state(ctx, buf, size);
+ #endif
++#if CONFIG_ARESAMPLE_FILTER
++    if (!strcmp(ctx->filter->name, "aresample")) {
++        struct SwrContext *swr = ff_aresample_get_swr(ctx);
++        if (!swr)
++            return AVERROR(EINVAL);
++        /* Reader validates component_id = 0x0002 and config_hash match. */
++        return swr_set_state(swr, buf, size);
++    }
++#endif
+     return AVERROR(ENOSYS);
+ }
+

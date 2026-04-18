@@ -7,11 +7,67 @@
 #include <libavfilter/buffersrc.h>
 #include <libavfilter/buffersink.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/mem.h>
 #include <libavutil/opt.h>
 #include "audio_encoder.h"
 #include "audio_decoder.h"
 #include "volume_map.h"
 #include "../input/frames_source_memory.h"
+
+// stateful-audio: compile-time probe for filter state API (patch 0006+0007)
+#if defined(LIBAVFILTER_VERSION_INT) && \
+    LIBAVFILTER_VERSION_INT >= AV_VERSION_INT(11, 16, 100)
+#define VOD_HAVE_FILTER_STATE_API 1
+#else
+#define VOD_HAVE_FILTER_STATE_API 0
+#endif
+
+// FFSA wire constants (see stateful-aac-validation/design/state-format.md §1)
+#define VOD_FFSA_HEADER_SIZE   36
+#define VOD_FFSA_TRAILER_SIZE  4
+#define VOD_FFSA_MIN_BLOB_SIZE (VOD_FFSA_HEADER_SIZE + VOD_FFSA_TRAILER_SIZE)
+#define VOD_FFSA_COMPONENT_AAC_ENCODER 0x0001
+#define VOD_FFSA_COMPONENT_ARESAMPLE   0x0002
+#define VOD_FFSA_COMPONENT_AMIX        0x0003
+
+// Big-endian scalar reads used for walking the FFSA header at transport level.
+// Kept private to this TU so we never link libavcodec/state_format.c from here.
+static inline uint16_t
+vod_ffsa_rd_u16be(const uint8_t* p)
+{
+	return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+
+static inline uint32_t
+vod_ffsa_rd_u32be(const uint8_t* p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+	       ((uint32_t)p[2] <<  8) | (uint32_t)p[3];
+}
+
+// Walk one FFSA blob at *cursor. Return blob length (including header and
+// trailer), 0 on malformed (so the caller can bail).
+// On success, *out_component_id is set from the blob header (offset 8..9).
+static size_t
+vod_ffsa_peek_blob(const uint8_t* cursor, size_t remaining, uint16_t* out_component_id)
+{
+	uint32_t payload_length;
+	size_t   total;
+
+	if (remaining < VOD_FFSA_MIN_BLOB_SIZE)
+		return 0;
+	if (cursor[0] != 'F' || cursor[1] != 'F' ||
+	    cursor[2] != 'S' || cursor[3] != 'A')
+		return 0;
+
+	payload_length = vod_ffsa_rd_u32be(cursor + 32);
+	total = VOD_FFSA_HEADER_SIZE + (size_t)payload_length + VOD_FFSA_TRAILER_SIZE;
+	if (total > remaining || total < VOD_FFSA_MIN_BLOB_SIZE)
+		return 0;
+
+	*out_component_id = vod_ffsa_rd_u16be(cursor + 8);
+	return total;
+}
 
 // constants
 #define BUFFERSRC_ARGS_FORMAT ("time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%uxL%Z")
@@ -637,6 +693,318 @@ audio_filter_init_sources_and_graph_desc(audio_filter_init_context_t* state, med
 	return VOD_OK;
 }
 
+// Locate the first filter instance in the graph whose name matches `name`.
+// Used by the state hook to target amix/aresample instances. If there are
+// multiple instances of the same filter in the graph (uncommon for our
+// layouts) we only match the first — acceptable for restore because the
+// capture path produces at most one blob per filter name in the emitted
+// order (see audio_filter_capture_filter_state).
+static AVFilterContext*
+audio_filter_find_by_name(AVFilterGraph* graph, const char* name)
+{
+	unsigned i;
+	if (graph == NULL || name == NULL)
+		return NULL;
+	for (i = 0; i < graph->nb_filters; i++)
+	{
+		AVFilterContext* f = graph->filters[i];
+		if (f == NULL || f->filter == NULL || f->filter->name == NULL)
+			continue;
+		if (vod_strcmp((const u_char*)f->filter->name, (const u_char*)name) == 0)
+			return f;
+	}
+	return NULL;
+}
+
+// Dev diagnostic: log every filter name in a configured graph once per
+// request so we can see whether libavfilter auto-inserted aresample /
+// aformat / etc. between our declared nodes. Useful for verifying which
+// filter instances are candidates for the state hook. Logs at debug
+// level — compile-time enable via AUDIO_FILTER_DEBUG_GRAPH.
+#ifdef AUDIO_FILTER_DEBUG_GRAPH
+static void
+audio_filter_log_graph(request_context_t* request_context, AVFilterGraph* graph)
+{
+	unsigned i;
+	if (graph == NULL)
+		return;
+	for (i = 0; i < graph->nb_filters; i++)
+	{
+		AVFilterContext* f = graph->filters[i];
+		const char* name = (f && f->filter && f->filter->name) ? f->filter->name : "(null)";
+		const char* inst = (f && f->name) ? f->name : "(null)";
+		vod_log_debug2(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+			"audio_filter_log_graph: filter=\"%s\" inst=\"%s\"",
+			name, inst);
+		(void)i;
+	}
+}
+#endif
+
+// Split a concatenated FFSA state-in blob into component slices. The AAC
+// encoder blob (component 0x0001) is returned via out_encoder_{data,size}
+// so audio_encoder_init can consume it exactly as before. Filter blobs
+// (aresample 0x0002, amix 0x0003) are applied in-place to their matching
+// filter instances via avfilter_set_filter_state. If a filter blob is
+// present but its target filter is absent from the graph we log a warning
+// and skip — the calling code continues with whatever filter state the
+// blob could not be applied to running fresh for that one segment.
+//
+// Returns VOD_OK on best-effort success. Any restore failure at the filter
+// layer is logged and does NOT fail the request (graceful degradation, per
+// the encoder-state hook pattern). Malformed transport-level framing is
+// treated as "no state" and falls through to fresh init.
+static vod_status_t
+audio_filter_restore_state(
+	request_context_t* request_context,
+	AVFilterGraph* graph,
+	const u_char* blob,
+	size_t size,
+	const u_char** out_encoder_data,
+	size_t* out_encoder_size)
+{
+	const uint8_t* cursor;
+	size_t remaining;
+
+	*out_encoder_data = NULL;
+	*out_encoder_size = 0;
+
+	if (blob == NULL || size == 0)
+		return VOD_OK;
+
+	cursor    = (const uint8_t*)blob;
+	remaining = size;
+
+	while (remaining > 0)
+	{
+		uint16_t component_id = 0;
+		size_t   blob_len     = vod_ffsa_peek_blob(cursor, remaining, &component_id);
+
+		if (blob_len == 0)
+		{
+			vod_log_error(VOD_LOG_WARN, request_context->log, 0,
+				"audio_filter_restore_state: malformed FFSA blob at offset %uz, stopping walk",
+				size - remaining);
+			break;
+		}
+
+		switch (component_id)
+		{
+		case VOD_FFSA_COMPONENT_AAC_ENCODER:
+			if (*out_encoder_data == NULL)
+			{
+				*out_encoder_data = (const u_char*)cursor;
+				*out_encoder_size = blob_len;
+			}
+			break;
+
+#if VOD_HAVE_FILTER_STATE_API
+		case VOD_FFSA_COMPONENT_ARESAMPLE:
+		{
+			AVFilterContext* f = audio_filter_find_by_name(graph, "aresample");
+			if (f == NULL)
+			{
+				vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+					"audio_filter_restore_state: aresample blob present (%uz bytes) but "
+					"no aresample filter in graph, skipping", blob_len);
+			}
+			else
+			{
+				int avrc = avfilter_set_filter_state(f, cursor, blob_len);
+				if (avrc < 0)
+				{
+					vod_log_error(VOD_LOG_WARN, request_context->log, 0,
+						"audio_filter_restore_state: avfilter_set_filter_state(aresample) failed %d, "
+						"continuing with fresh filter state", avrc);
+				}
+				else
+				{
+					vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+						"audio_filter_restore_state: restored aresample state (%uz bytes)",
+						blob_len);
+				}
+			}
+			break;
+		}
+
+		case VOD_FFSA_COMPONENT_AMIX:
+		{
+			AVFilterContext* f = audio_filter_find_by_name(graph, "amix");
+			if (f == NULL)
+			{
+				vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+					"audio_filter_restore_state: amix blob present (%uz bytes) but "
+					"no amix filter in graph, skipping", blob_len);
+			}
+			else
+			{
+				int avrc = avfilter_set_filter_state(f, cursor, blob_len);
+				if (avrc < 0)
+				{
+					vod_log_error(VOD_LOG_WARN, request_context->log, 0,
+						"audio_filter_restore_state: avfilter_set_filter_state(amix) failed %d, "
+						"continuing with fresh filter state", avrc);
+				}
+				else
+				{
+					vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+						"audio_filter_restore_state: restored amix state (%uz bytes)",
+						blob_len);
+				}
+			}
+			break;
+		}
+#else
+		case VOD_FFSA_COMPONENT_ARESAMPLE:
+		case VOD_FFSA_COMPONENT_AMIX:
+			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+				"audio_filter_restore_state: filter blob component=0x%04uxD "
+				"ignored (ffmpeg lacks filter-state API)", (unsigned)component_id);
+			break;
+#endif
+
+		default:
+			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+				"audio_filter_restore_state: unknown component=0x%04uxD, skipping",
+				(unsigned)component_id);
+			break;
+		}
+
+		cursor    += blob_len;
+		remaining -= blob_len;
+	}
+
+	return VOD_OK;
+}
+
+#if VOD_HAVE_FILTER_STATE_API
+// Concatenate filter-state blobs for every amix/aresample instance in the
+// graph onto the existing encoder blob at *state_out_data. Called exactly
+// once per segment, after audio_encoder_flush has finished populating the
+// encoder slot. On success, *state_out_data is replaced with a freshly
+// av_malloc'd buffer containing (encoder_blob || filter_blob_1 || ... ||
+// filter_blob_N), the old encoder blob is av_free'd, and *state_out_size
+// is updated. Individual filter blob mallocs are also av_free'd after copy.
+//
+// Any failure to capture a filter's state is logged and the filter is
+// skipped — the remainder of the segment's blob (encoder + successfully
+// captured filters) is still POSTed. The next segment's restore path
+// tolerates missing components.
+//
+// Order of filter names matters for the transport: "aresample" before
+// "amix" matches the natural audio-graph dataflow order (resample → mix).
+// The reader parses by header length and does not rely on this order for
+// correctness, but keeping it stable simplifies diagnosis.
+//
+// Currently only aresample is captured. amix capture is intentionally
+// disabled: ff_amix_set_state correctly re-applies the serialised FIFO +
+// frame_list state, but the interaction with nginx-vod-module's single
+// per-segment graph-build/tear-down cycle produces stalled activation
+// on the next segment when the restored FIFO contains any samples. The
+// restore succeeds, the next segment's amix reports correct input_state,
+// but activate() then fails to request new frames — no encoder input,
+// the segment's TS mux emits 0 AAC packets, and the stream breaks. This
+// is an ffmpeg-amix-side quirk orthogonal to the transport-layer concat
+// work, and out of scope here; tracked at the decision-log level. The
+// transport layer handles both aresample and amix blobs symmetrically,
+// so extending to amix later is a single-line change once the activate
+// quirk is isolated.
+static void
+audio_filter_capture_filter_state(
+	request_context_t* request_context,
+	AVFilterGraph* graph,
+	u_char** state_out_data,
+	size_t* state_out_size)
+{
+	static const char* const kFilterNames[] = { "aresample" };
+	u_char* filter_blobs[sizeof(kFilterNames) / sizeof(kFilterNames[0])];
+	size_t  filter_sizes[sizeof(kFilterNames) / sizeof(kFilterNames[0])];
+	size_t  total_filter_bytes = 0;
+	size_t  n_filters = sizeof(kFilterNames) / sizeof(kFilterNames[0]);
+	size_t  i;
+	size_t  new_size;
+	u_char* new_blob;
+	size_t  off;
+
+	vod_memzero(filter_blobs, sizeof(filter_blobs));
+	vod_memzero(filter_sizes, sizeof(filter_sizes));
+
+	if (graph == NULL || state_out_data == NULL || state_out_size == NULL)
+		return;
+	if (*state_out_data == NULL || *state_out_size == 0)
+		return;
+
+	for (i = 0; i < n_filters; i++)
+	{
+		AVFilterContext* f = audio_filter_find_by_name(graph, kFilterNames[i]);
+		uint8_t*         buf = NULL;
+		size_t           sz  = 0;
+		int              avrc;
+
+		if (f == NULL)
+			continue;
+
+		avrc = avfilter_get_filter_state(f, &buf, &sz);
+		if (avrc == AVERROR(ENOSYS))
+			continue;
+		if (avrc < 0 || buf == NULL || sz == 0)
+		{
+			vod_log_error(VOD_LOG_WARN, request_context->log, 0,
+				"audio_filter_capture_filter_state: avfilter_get_filter_state(%s) failed %d",
+				kFilterNames[i], avrc);
+			if (buf != NULL)
+				av_free(buf);
+			continue;
+		}
+
+		filter_blobs[i]    = buf;
+		filter_sizes[i]    = sz;
+		total_filter_bytes += sz;
+
+		vod_log_debug2(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+			"audio_filter_capture_filter_state: captured %s state (%uz bytes)",
+			kFilterNames[i], sz);
+	}
+
+	if (total_filter_bytes == 0)
+		return;
+
+	new_size = *state_out_size + total_filter_bytes;
+	new_blob = av_malloc(new_size);
+	if (new_blob == NULL)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"audio_filter_capture_filter_state: av_malloc(%uz) failed, "
+			"dropping filter blobs (encoder state still POSTed)", new_size);
+		for (i = 0; i < n_filters; i++)
+		{
+			if (filter_blobs[i] != NULL)
+				av_free(filter_blobs[i]);
+		}
+		return;
+	}
+
+	vod_memcpy(new_blob, *state_out_data, *state_out_size);
+	off = *state_out_size;
+	for (i = 0; i < n_filters; i++)
+	{
+		if (filter_blobs[i] == NULL)
+			continue;
+		vod_memcpy(new_blob + off, filter_blobs[i], filter_sizes[i]);
+		off += filter_sizes[i];
+		av_free(filter_blobs[i]);
+	}
+
+	av_free(*state_out_data);
+	*state_out_data = new_blob;
+	*state_out_size = new_size;
+
+	vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+		"audio_filter_capture_filter_state: emitted concatenated blob (%uz bytes total)",
+		new_size);
+}
+#endif  // VOD_HAVE_FILTER_STATE_API
+
 vod_status_t
 audio_filter_alloc_state(
 	request_context_t* request_context,
@@ -805,6 +1173,11 @@ audio_filter_alloc_state(
 		rc = VOD_UNEXPECTED;
 		goto end;
 	}
+
+#ifdef AUDIO_FILTER_DEBUG_GRAPH
+	// Diagnostic: dump the configured filter graph's node list.
+	audio_filter_log_graph(request_context, state->filter_graph);
+#endif
 	
 	// initialize the encoder
 	sink_link = state->sink.buffer_sink->inputs[0];
@@ -842,15 +1215,41 @@ audio_filter_alloc_state(
 		encoder_params.timescale = sink_link->time_base.den;
 		encoder_params.bitrate = output_track->media_info.bitrate;
 
-		// stateful-audio: thread the FFSA shuttle from request_context
+		// stateful-audio: thread the FFSA shuttle from request_context. The
+		// shuttle's state_in blob may be a concatenation of per-component
+		// FFSA blobs (encoder || aresample || amix). Split them at the
+		// transport layer: audio_filter_restore_state identifies the encoder
+		// slice to hand off to audio_encoder_init (unchanged codepath) and
+		// applies filter-state blobs directly to matching filter instances
+		// in the freshly-configured graph BEFORE any frames are pushed —
+		// this is the ordering constraint from the design spec, since
+		// amix/aresample internal buffers must exist before frame arrival.
 		encoder_params.state_in_data  = NULL;
 		encoder_params.state_in_size  = 0;
 		encoder_params.state_out_data = NULL;
 		encoder_params.state_out_size = NULL;
 		if (request_context->audio_encoder_state_shuttle != NULL)
 		{
-			encoder_params.state_in_data  = request_context->audio_encoder_state_shuttle->state_in_data;
-			encoder_params.state_in_size  = request_context->audio_encoder_state_shuttle->state_in_size;
+			const u_char* encoder_slice_data = NULL;
+			size_t        encoder_slice_size = 0;
+
+			rc = audio_filter_restore_state(
+				request_context,
+				state->filter_graph,
+				request_context->audio_encoder_state_shuttle->state_in_data,
+				request_context->audio_encoder_state_shuttle->state_in_size,
+				&encoder_slice_data,
+				&encoder_slice_size);
+			if (rc != VOD_OK)
+			{
+				goto end;
+			}
+
+			// If no encoder slice was found inside the concatenated blob,
+			// fall through with NULL state_in — audio_encoder_init will run
+			// fresh (priming artefact for that one segment, acceptable).
+			encoder_params.state_in_data  = encoder_slice_data;
+			encoder_params.state_in_size  = encoder_slice_size;
 			encoder_params.state_out_data = request_context->audio_encoder_state_shuttle->state_out_data;
 			encoder_params.state_out_size = request_context->audio_encoder_state_shuttle->state_out_size;
 		}
@@ -1222,6 +1621,27 @@ audio_filter_process(void* context)
 						return rc;
 					}
 				}
+
+#if VOD_HAVE_FILTER_STATE_API
+				// stateful-audio: encoder has just deposited its blob into
+				// the shuttle's state_out_data. Append filter-state blobs
+				// so the POST body carries the full set. Ordering: AFTER
+				// encoder_flush (so the encoder's AFQ and planar buffers
+				// reflect end-of-segment), BEFORE audio_filter_update_track
+				// (which only rearranges output packets). The filter graph
+				// is still alive at this point — audio_filter_free_state
+				// runs later via pool cleanup.
+				if (state->request_context->audio_encoder_state_shuttle != NULL &&
+				    state->request_context->audio_encoder_state_shuttle->state_out_data != NULL &&
+				    state->request_context->audio_encoder_state_shuttle->state_out_size != NULL)
+				{
+					audio_filter_capture_filter_state(
+						state->request_context,
+						state->filter_graph,
+						state->request_context->audio_encoder_state_shuttle->state_out_data,
+						state->request_context->audio_encoder_state_shuttle->state_out_size);
+				}
+#endif
 
 				return audio_filter_update_track(state);
 			}
