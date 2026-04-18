@@ -141,12 +141,15 @@ audio_encoder_init(
 	encoder->bit_rate = params->bitrate;
 	encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;		// make the codec generate the extra data
 
-	// stateful-audio: if caller will restore prior state, opt into BITEXACT
-	// so suppresses the periodic LIBAVCODEC_IDENT filler. See FFSA §1 flags bit 1.
-	if (params->state_in_data != NULL && params->state_in_size > 0)
-	{
-		encoder->flags |= AV_CODEC_FLAG_BITEXACT;
-	}
+	// stateful-audio: ALWAYS opt into BITEXACT, not only when restoring.
+	// Rationale: every segment's encoder must produce the same config_hash
+	// for FFSA blob compatibility. If cold-start segments run with
+	// BITEXACT=0 and then seg-N+1 sets BITEXACT=1 to restore, seg-N+1's
+	// avcodec_set_encoder_state fails with EINVAL (config_hash mismatch)
+	// → falls back to fresh encoder → priming silence at that boundary.
+	// Must be set BEFORE avcodec_open2 so the opened encoder's extradata
+	// and state-format hash are consistent across save and restore paths.
+	encoder->flags |= AV_CODEC_FLAG_BITEXACT;
 
 	avrc = avcodec_open2(encoder, encoder_codec, NULL);
 	if (avrc < 0)
