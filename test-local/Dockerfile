@@ -32,6 +32,7 @@ COPY test-local/ffmpeg-patches/0001-state-format-framework.patch \
      test-local/ffmpeg-patches/0005-avfilter-amix-state.patch \
      test-local/ffmpeg-patches/0006-swr-amix-public-api.patch \
      test-local/ffmpeg-patches/0007-avfilter-aresample-state-route.patch \
+     test-local/ffmpeg-patches/0008-amix-post-eof-input-state-clamp.patch \
      /tmp/ffmpeg-patches/
 RUN cd /tmp/ffmpeg && \
     patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0001-state-format-framework.patch && \
@@ -40,7 +41,8 @@ RUN cd /tmp/ffmpeg && \
     patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0006-swr-amix-public-api.patch && \
     patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0004-swresample-state.patch && \
     patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0003-public-api.patch && \
-    patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0007-avfilter-aresample-state-route.patch
+    patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0007-avfilter-aresample-state-route.patch && \
+    patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0008-amix-post-eof-input-state-clamp.patch
 
 # Minimal build — native AAC encoder only (no libfdk_aac). Mirrors the subset
 # that nginx-vod-module actually needs for HLS audio muxing.

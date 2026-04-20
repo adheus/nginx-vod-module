@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stateful-audio <stateful-audio@ffmpeg.devel>
+Date: Thu, 16 Apr 2026 10:00:00 -0300
+Subject: [PATCH 8/8] lavfi/af_amix: clamp input_state to INPUT_ON at
+ ff_amix_set_state restore time
+
+Phase 11 resolution: eliminates a stall in ff_amix_set_state when the
+captured state snapshot reflects end-of-prior-segment semantics
+(INPUT_EOF set on every input, INPUT_ON cleared because fifos drained).
+
+Integration callers such as nginx-vod-module flush every buffersrc with
+NULL when a source exhausts (audio_filter_choose_source), then capture
+amix state after audio_encoder_flush. By that point amix's activate()
+has observed status=EOF on every inlink, drained each fifo, and cleared
+INPUT_ON per af_amix.c:481-483. Restoring that byte-for-byte onto a
+freshly-configured graph causes calc_active_inputs() to return
+AVERROR_EOF on the first activate() call -- the restored graph emits
+zero output for the remainder of the segment.
+
+The captured EOF bits describe transport-level source readiness at the
+end of the PRIOR segment; on the RESUMED segment the sources are fresh
+buffersrcs that have not yet reached EOF. scale_norm[], next_pts, and
+frame_list remain meaningful DSP-level state. Only the input_state[]
+EOF flags must be rewritten.
+
+Library reproducer: test-harness/phase11_amix_repro.c in the
+stateful-aac-validation repo. Pre-fix: chunks 1..3 emit 0 samples
+(stall). Post-fix: all 4 chunks emit full CHUNK_FRAMES*FRAME_SIZE
+samples (110592 each). bit_exact_amix --matrix remains 25/25 PASS.
+
+Signed-off-by: stateful-audio <stateful-audio@ffmpeg.devel>
+---
+ libavfilter/af_amix.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+--- a/libavfilter/af_amix.c
++++ b/libavfilter/af_amix.c
+@@ -1123,6 +1123,24 @@ int ff_amix_set_state(AVFilterContext *ctx, const uint8_t *buf, size_t size)
+     /* pass 2: apply */
+     ff_ffsa_reader_find(&r, FFSA_AMIX_INPUT_STATE, &val, &vlen);
+     memcpy(s->input_state, val, (size_t)s->nb_inputs);
++
++    /* Phase 11 fix: when restoring amix state onto a freshly-configured
++     * graph (e.g. nginx-vod-module per-segment construction), the captured
++     * input_state reflects end-of-prior-segment semantics where sources
++     * have been flushed with EOF and their fifos drained. Restoring that
++     * byte-for-byte would leave INPUT_ON cleared across all inputs,
++     * causing activate() to observe active_inputs==0 and immediately
++     * emit AVERROR_EOF -- the restored graph produces zero output.
++     *
++     * The semantically correct behaviour is: on a resumed graph the
++     * inputs are fresh (new buffersrcs, no EOF yet), so we must clear
++     * INPUT_EOF and set INPUT_ON for every input. scale_norm[] /
++     * next_pts / frame_list contents are still meaningful state to carry
++     * forward; only the EOF flags need rewriting because they describe
++     * transport-level input readiness, not the mixer's internal DSP. */
++    for (i = 0; i < s->nb_inputs; i++) {
++        s->input_state[i] = INPUT_ON;
++    }
+ 
+     ff_ffsa_reader_find(&r, FFSA_AMIX_SCALE_NORM, &val, &vlen);
+     for (i = 0; i < s->nb_inputs; i++)
+ 

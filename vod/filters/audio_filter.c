@@ -916,7 +916,7 @@ audio_filter_capture_filter_state(
 	u_char** state_out_data,
 	size_t* state_out_size)
 {
-	static const char* const kFilterNames[] = { "aresample" };
+	static const char* const kFilterNames[] = { "aresample", "amix" };   /* Phase 13: 0008 patch clamps input_state on restore */
 	u_char* filter_blobs[sizeof(kFilterNames) / sizeof(kFilterNames[0])];
 	size_t  filter_sizes[sizeof(kFilterNames) / sizeof(kFilterNames[0])];
 	size_t  total_filter_bytes = 0;
