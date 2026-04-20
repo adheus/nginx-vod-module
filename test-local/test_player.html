@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Stateful AAC — A/B test player</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; padding: 20px; max-width: 1100px; }
+    h1 { margin-bottom: 4px; }
+    .subtitle { color: #666; margin-bottom: 24px; font-size: 13px; }
+    .case { border: 1px solid #ddd; border-radius: 6px; padding: 14px 16px; margin-bottom: 14px; }
+    .case h3 { margin: 0 0 6px; font-size: 15px; }
+    .case .hint { font-size: 12px; color: #555; margin-bottom: 10px; }
+    .ab { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .variant { border: 1px solid #eee; border-radius: 4px; padding: 10px; }
+    .variant .label { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; margin-bottom: 8px; }
+    .variant.off .label { background: #fde7d1; color: #8a4a10; }
+    .variant.on  .label { background: #dfeedd; color: #1c5a16; }
+    .variant .url { font-size: 11px; color: #777; font-family: ui-monospace, monospace; margin-bottom: 8px; word-break: break-all; }
+    video, audio { width: 100%; display: block; }
+    .status { font-size: 11px; color: #999; font-family: ui-monospace, monospace; margin-top: 6px; min-height: 16px; }
+    .status.err { color: #b11; }
+  </style>
+</head>
+<body>
+  <h1>Stateful AAC — A/B test player</h1>
+  <div class="subtitle">
+    Left column: state hook OFF (every segment has fresh MDCT priming = the industry-standard bug).<br>
+    Right column: state hook ON (encoder state serialised/restored across segment boundaries = gapless).<br>
+    Listen for snaps/clicks at ~4s intervals on the left side; they should be absent on the right.
+  </div>
+
+  <div id="cases"></div>
+
+  <script>
+    const HOST = location.host;
+    const OFF_BASE = `http://${HOST}/nostate/hls`;
+    const ON_BASE  = `http://${HOST}/mapped/hls`;
+
+    const CASES = [
+      {
+        id: 'song_full',
+        title: 'Mix — 6 separate stem files (vocals, drums, bass, guitars, piano, other)',
+        hint: 'mixFilter + gainFilter per stem. Primary use case for the state hook.',
+        media: 'audio', path: '/song_full/index.m3u8',
+      },
+      {
+        id: 'mt_audio_only',
+        title: 'Mix — 6 stems from a multi-track MP4',
+        hint: 'Same filter chain, different source shape. The full-song research case.',
+        media: 'audio', path: '/mt_audio_only/index.m3u8',
+      },
+      {
+        id: 'mt_guitars_plus_vocals',
+        title: 'Mix — guitars + vocals from multi-track MP4',
+        hint: '2-input mix. Transient-rich content (guitar attacks).',
+        media: 'audio', path: '/mt_guitars_plus_vocals/index.m3u8',
+      },
+      {
+        id: 'song_key_up_2',
+        title: 'Mix + keyChangeFilter (+2 semitones)',
+        hint: 'Exercises the custom pitch-shift filter.',
+        media: 'audio', path: '/song_key_up_2/index.m3u8',
+      },
+      {
+        id: 'mt_full',
+        title: 'Video + mix from multi-track MP4',
+        hint: 'Video passthrough + audio re-encode with state hook.',
+        media: 'video', path: '/mt_full/master.m3u8',
+      },
+    ];
+
+    const container = document.getElementById('cases');
+
+    function attach(mediaEl, statusEl, url) {
+      if (Hls.isSupported()) {
+        const hls = new Hls();
+        hls.on(Hls.Events.ERROR, (_e, d) => {
+          statusEl.classList.add('err');
+          statusEl.textContent = `${d.type} / ${d.details}${d.reason ? ' — ' + d.reason : ''}`;
+        });
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          statusEl.classList.remove('err');
+          statusEl.textContent = 'ready';
+        });
+        hls.on(Hls.Events.FRAG_LOADED, (_e, d) => {
+          statusEl.textContent = `seg ${d.frag.sn} loaded (${d.frag.duration.toFixed(2)}s)`;
+        });
+        hls.loadSource(url);
+        hls.attachMedia(mediaEl);
+      } else if (mediaEl.canPlayType('application/vnd.apple.mpegurl')) {
+        mediaEl.src = url;
+        statusEl.textContent = 'native HLS';
+      } else {
+        statusEl.classList.add('err');
+        statusEl.textContent = 'no HLS support';
+      }
+    }
+
+    for (const c of CASES) {
+      const urlOff = OFF_BASE + c.path;
+      const urlOn  = ON_BASE  + c.path;
+      const el = document.createElement('div');
+      el.className = 'case';
+      el.innerHTML = `
+        <h3>${c.title}</h3>
+        <div class="hint">${c.hint}</div>
+        <div class="ab">
+          <div class="variant off">
+            <span class="label">STATE HOOK OFF</span>
+            <div class="url">${urlOff}</div>
+            <${c.media} id="off-${c.id}" controls preload="none"></${c.media}>
+            <div class="status" id="off-status-${c.id}"></div>
+          </div>
+          <div class="variant on">
+            <span class="label">STATE HOOK ON</span>
+            <div class="url">${urlOn}</div>
+            <${c.media} id="on-${c.id}" controls preload="none"></${c.media}>
+            <div class="status" id="on-status-${c.id}"></div>
+          </div>
+        </div>
+      `;
+      container.appendChild(el);
+      attach(el.querySelector(`#off-${c.id}`), el.querySelector(`#off-status-${c.id}`), urlOff);
+      attach(el.querySelector(`#on-${c.id}`),  el.querySelector(`#on-status-${c.id}`),  urlOn);
+    }
+  </script>
+</body>
+</html>
