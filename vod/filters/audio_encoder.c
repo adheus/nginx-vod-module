@@ -427,6 +427,21 @@ audio_encoder_update_media_info(
 	media_info->u.audio.packet_size = 0;			// ffmpeg always writes 0 (mov_write_audio_tag)
 	media_info->u.audio.sample_rate = encoder->sample_rate;
 
+	// Phase 7: AAC encoder's initial_padding is the MDCT lookahead — 1024
+	// samples for the native AAC encoder at line ~1192 in libavcodec/aacenc.c.
+	// Expose it as codec_delay (nanoseconds, consistent with existing Opus
+	// path in mp4_parser.c:2210) so mp4_init_segment can emit an edts/elst
+	// edit list that tells the player to skip these priming samples.
+	if (encoder->initial_padding > 0 && encoder->sample_rate > 0)
+	{
+		media_info->codec_delay = (uint64_t)encoder->initial_padding
+			* 1000000000 / encoder->sample_rate;
+	}
+	else
+	{
+		media_info->codec_delay = 0;
+	}
+
 	new_extra_data = vod_alloc(state->request_context->pool, encoder->extradata_size);
 	if (new_extra_data == NULL)
 	{

@@ -432,6 +432,26 @@ filter_init_filtered_clips(
 				{
 					new_track->source_clip = input_clip;
 					media_set->audio_filtering_needed = TRUE;
+
+					// Phase 7: mark the re-encoded audio track with the
+					// native AAC encoder's MDCT lookahead. Predicting 1024
+					// samples of priming at this layer lets mp4_init_segment
+					// emit an edts/elst even though the encoder hasn't been
+					// invoked yet (init segments are built before the first
+					// segment request). The prediction holds for any audio
+					// track routed through audio_filter + audio_encoder — we
+					// pin the native AAC encoder in audio_encoder.c and its
+					// initial_padding is deterministic (1024 samples) for
+					// the sample formats we produce. If future codec pins
+					// diverge, move this constant into audio_encoder.h.
+					if (new_track->media_info.media_type == MEDIA_TYPE_AUDIO
+						&& new_track->media_info.u.audio.sample_rate > 0
+						&& new_track->media_info.codec_delay == 0)
+					{
+						new_track->media_info.codec_delay = (uint64_t)1024
+							* 1000000000ULL
+							/ new_track->media_info.u.audio.sample_rate;
+					}
 				}
 			}
 

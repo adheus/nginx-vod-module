@@ -35,6 +35,7 @@ typedef struct {
 	size_t minf_size;
 	size_t mdia_size;
 	size_t trak_size;
+	size_t edts_size;  // Phase 7: 0 or (2*ATOM_HEADER + elst header + 1 entry)
 } track_sizes_t;
 
 typedef struct {
@@ -295,6 +296,74 @@ mp4_init_segment_get_track_sizes(
 	}
 	result->mdia_size = ATOM_HEADER_SIZE + mdhd_atom_size + hdlr_atom_size + result->minf_size;
 	result->trak_size = ATOM_HEADER_SIZE + tkhd_atom_size + result->mdia_size;
+
+	// Phase 7: audio priming compensation via edts/elst. When the encoder
+	// reports a non-zero codec_delay (AAC MDCT lookahead, typically 1024
+	// samples; populated in audio_encoder_update_media_info), emit a
+	// single-entry edit list that tells the player to skip the priming
+	// samples. Players that honour elst (hls.js, Shaka, AVPlayer,
+	// ExoPlayer) will render seamless audio from decode-time 0. Players
+	// that ignore elst still get clean output; they simply don't skip
+	// the ~23 ms of priming silence.
+	//
+	// Size: ATOM_HEADER_SIZE(edts=8) + ATOM_HEADER_SIZE(elst=8) +
+	//       sizeof(elst_atom_t)=4+4 + sizeof(elst_entry_t)=12 = 32 bytes.
+	result->edts_size = 0;
+	if (cur_track->media_info.media_type == MEDIA_TYPE_AUDIO &&
+		cur_track->media_info.codec_delay > 0)
+	{
+		result->edts_size = 2 * ATOM_HEADER_SIZE
+			+ sizeof(elst_atom_t) + sizeof(elst_entry_t);
+		result->trak_size += result->edts_size;
+	}
+}
+
+// Phase 7: emit an `edts` → `elst` edit list for audio priming compensation.
+// Writes a single v0 entry that covers the entire movie duration and
+// declares the first `media_time` samples (in media timescale) as priming
+// to skip. Per ISO/IEC 14496-12 §8.6.5, a media_time value > 0 at the
+// start of the first entry tells the player to begin presentation at the
+// given track-media-time, effectively skipping AAC MDCT lookahead.
+//
+// Args:
+//   p             : write cursor
+//   segment_duration_mvhd : total movie duration in mvhd timescale (elst v0)
+//   media_time_samples    : priming samples to skip, in media timescale
+//
+// Returns: advanced write cursor. Writes exactly 32 bytes.
+static u_char*
+mp4_init_segment_write_edts_atom(u_char* p,
+	uint64_t segment_duration_mvhd,
+	uint64_t media_time_samples)
+{
+	size_t edts_size = 2 * ATOM_HEADER_SIZE
+		+ sizeof(elst_atom_t) + sizeof(elst_entry_t);
+	size_t elst_size = ATOM_HEADER_SIZE
+		+ sizeof(elst_atom_t) + sizeof(elst_entry_t);
+
+	// edts container
+	write_atom_header(p, edts_size, 'e', 'd', 't', 's');
+
+	// elst (version 0, 32-bit fields)
+	write_atom_header(p, elst_size, 'e', 'l', 's', 't');
+	write_be32(p, 0);                                // version=0, flags=0
+	write_be32(p, 1);                                // entry_count=1
+
+	// Single entry. segment_duration is clamped to u32 range for v0; since
+	// audio priming compensation is always short, this is safe for any
+	// reasonable track duration.
+	uint32_t seg_dur32 = segment_duration_mvhd > 0xFFFFFFFFULL
+		? 0xFFFFFFFFU
+		: (uint32_t)segment_duration_mvhd;
+	uint32_t mt32 = media_time_samples > 0xFFFFFFFFULL
+		? 0xFFFFFFFFU
+		: (uint32_t)media_time_samples;
+	write_be32(p, seg_dur32);                        // segment_duration
+	write_be32(p, mt32);                             // media_time
+	write_be16(p, 1);                                // media_rate_integer = 1
+	write_be16(p, 0);                                // media_rate_fraction = 0
+
+	return p;
 }
 
 static u_char*
@@ -835,6 +904,19 @@ mp4_init_segment_write(
 				cur_track->media_info.media_type,
 				cur_track->media_info.u.video.width,
 				cur_track->media_info.u.video.height);
+		}
+
+		// Phase 7: moov.trak.edts for audio priming compensation. Only
+		// emitted when the encoder reported a non-zero codec_delay (see
+		// audio_encoder_update_media_info). Converts nanoseconds to the
+		// track's media timescale for elst.media_time.
+		if (track_sizes->edts_size > 0)
+		{
+			uint64_t media_time_samples =
+				cur_track->media_info.codec_delay
+				* cur_track->media_info.timescale
+				/ 1000000000ULL;
+			p = mp4_init_segment_write_edts_atom(p, duration, media_time_samples);
 		}
 
 		// moov.trak.mdia
