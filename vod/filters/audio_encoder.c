@@ -409,69 +409,90 @@ audio_encoder_flush(
 		int      grc = avcodec_get_encoder_state(state->encoder, &blob, &blob_sz);
 		if (grc == 0 && blob != NULL && blob_sz > 0)
 		{
-			// Phase 23 Candidate A probe: find first and last byte offsets
-			// where pre-drain and post-drain blobs differ. Blobs are the
-			// same wire format so differing byte ranges map to differing
-			// atoms. Log offset + length + hex snippet to identify which
-			// atom is being mutated by drain.
-			if (pre_drain_blob != NULL && pre_drain_sz == blob_sz)
+			// Phase 23 Candidate D probe: walk both pre-drain and
+			// post-drain blobs atom-by-atom and report per-atom mutations.
+			// Previous byte-range diff only reported the single contiguous
+			// diff region at blob end (FRAME_NUM + CRC), missing atoms
+			// earlier in the blob that may also mutate (e.g.
+			// PLANAR_SAMPLES if drain zeros the lookahead region).
+			//
+			// FFSA wire format:
+			//   [36-byte header] [atoms...] [4-byte CRC]
+			//   Each atom = u16 type BE + u16 flags BE + u32 length BE
+			//                + payload + pad-to-4-byte
+			if (pre_drain_blob != NULL && pre_drain_sz == blob_sz &&
+			    blob_sz > 40)
 			{
-				size_t first_diff = blob_sz;
-				size_t last_diff = 0;
-				size_t diff_count = 0;
-				for (size_t i = 0; i < blob_sz; i++)
+				size_t pre_off = 36, post_off = 36;
+				size_t atom_idx = 0;
+				size_t blob_end = blob_sz - 4;  // exclude CRC trailer
+				int any_atom_mutated = 0;
+				while (pre_off + 8 <= blob_end && post_off + 8 <= blob_end)
 				{
-					if (pre_drain_blob[i] != blob[i])
+					uint16_t pre_type  = ((uint16_t)pre_drain_blob[pre_off] << 8)
+					                   | pre_drain_blob[pre_off + 1];
+					uint16_t post_type = ((uint16_t)blob[post_off] << 8)
+					                   | blob[post_off + 1];
+					uint32_t pre_len = ((uint32_t)pre_drain_blob[pre_off+4] << 24)
+					                 | ((uint32_t)pre_drain_blob[pre_off+5] << 16)
+					                 | ((uint32_t)pre_drain_blob[pre_off+6] <<  8)
+					                 | (uint32_t)pre_drain_blob[pre_off+7];
+					uint32_t post_len = ((uint32_t)blob[post_off+4] << 24)
+					                  | ((uint32_t)blob[post_off+5] << 16)
+					                  | ((uint32_t)blob[post_off+6] <<  8)
+					                  | (uint32_t)blob[post_off+7];
+					uint32_t pre_pad  = (4 - (pre_len & 3)) & 3;
+					uint32_t post_pad = (4 - (post_len & 3)) & 3;
+
+					if (pre_type != post_type || pre_len != post_len)
 					{
-						if (first_diff == blob_sz) first_diff = i;
-						last_diff = i;
-						diff_count++;
+						vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+							"phase23_walk: atom_idx=%uz STRUCTURAL DIFF "
+							"pre(type=0x%04xD len=%uD) post(type=0x%04xD len=%uD)",
+							atom_idx, pre_type, pre_len, post_type, post_len);
+						break;
 					}
-				}
-				if (diff_count == 0)
-				{
-					vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-						"phase23_probe: post-drain blob IDENTICAL to pre-drain "
-						"(Candidate A REJECTED — drain does not mutate state)");
-				}
-				else
-				{
-					// Dump the actual byte values at the diff region so we
-					// can identify which atom is being mutated. Expand the
-					// window backward by 8 bytes to catch the preceding
-					// atom's type/length header.
-					size_t ctx_start = first_diff > 8 ? first_diff - 8 : 0;
-					size_t ctx_end = last_diff + 1 < blob_sz ? last_diff + 1 : blob_sz;
-					char pre_hex[256], post_hex[256];
-					int pre_off = 0, post_off = 0;
-					for (size_t i = ctx_start; i < ctx_end && pre_off < 240; i++)
+
+					// Same atom structurally. Diff the payload.
+					int payload_diff = 0;
+					uint32_t first_payload_diff = pre_len;
+					uint32_t diff_bytes = 0;
+					for (uint32_t i = 0; i < pre_len; i++)
 					{
-						pre_off += snprintf(pre_hex + pre_off, sizeof(pre_hex) - pre_off,
-							"%02x", pre_drain_blob[i]);
-						post_off += snprintf(post_hex + post_off, sizeof(post_hex) - post_off,
-							"%02x", blob[i]);
-						if ((i - ctx_start + 1) % 4 == 0 && i + 1 < ctx_end)
+						if (pre_drain_blob[pre_off + 8 + i] !=
+						    blob[post_off + 8 + i])
 						{
-							pre_off += snprintf(pre_hex + pre_off, sizeof(pre_hex) - pre_off, " ");
-							post_off += snprintf(post_hex + post_off, sizeof(post_hex) - post_off, " ");
+							payload_diff = 1;
+							if (first_payload_diff == pre_len) first_payload_diff = i;
+							diff_bytes++;
 						}
 					}
+					if (payload_diff)
+					{
+						any_atom_mutated = 1;
+						vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+							"phase23_walk: atom_idx=%uz type=0x%04xD len=%uD "
+							"MUTATED %uD bytes (first_diff_at_offset=%uD)",
+							atom_idx, pre_type, pre_len,
+							diff_bytes, first_payload_diff);
+					}
+
+					pre_off  += 8 + pre_len  + pre_pad;
+					post_off += 8 + post_len + post_pad;
+					atom_idx++;
+				}
+				if (!any_atom_mutated)
+				{
 					vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-						"phase23_probe: drain MUTATED %uz bytes at [%uz..%uz] in %uz-byte blob",
-						diff_count, first_diff, last_diff, blob_sz);
-					vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-						"phase23_probe: pre  bytes[%uz..%uz]: %s",
-						ctx_start, ctx_end, pre_hex);
-					vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-						"phase23_probe: post bytes[%uz..%uz]: %s",
-						ctx_start, ctx_end, post_hex);
+						"phase23_walk: %uz atoms — ALL IDENTICAL pre/post drain "
+						"(only CRC at blob tail changes; no content mutation)",
+						atom_idx);
 				}
 			}
-			else if (pre_drain_blob != NULL)
+			else if (pre_drain_blob != NULL && pre_drain_sz != blob_sz)
 			{
 				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-					"phase23_probe: blob size changed pre=%uz post=%uz — "
-					"drain added/removed atoms",
+					"phase23_walk: blob size changed pre=%uz post=%uz",
 					pre_drain_sz, blob_sz);
 			}
 			if (pre_drain_blob != NULL) av_free(pre_drain_blob);
