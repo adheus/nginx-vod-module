@@ -72,9 +72,30 @@
 
     const container = document.getElementById('cases');
 
+    // Cache-bust every URL the player requests. Without this, the browser
+    // and hls.js serve cached m3u8/init.mp4/.m4s/.ts from prior test runs,
+    // which silently invalidates A/B listening against a freshly-rebuilt
+    // container. The token is generated per-page-load so every reload
+    // forces fresh fetches.
+    const CACHE_BUST = `_cb=${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const bust = (u) => u + (u.includes('?') ? '&' : '?') + CACHE_BUST;
+
     function attach(mediaEl, statusEl, url) {
       if (Hls.isSupported()) {
-        const hls = new Hls();
+        const hls = new Hls({
+          // Force every XHR to include a no-cache request header + propagate
+          // the cache-bust token to sub-resources that hls.js resolves from
+          // the manifest.
+          xhrSetup: (xhr, requestUrl) => {
+            // hls.js passes the resolved URL; re-bust each request to
+            // guarantee uniqueness per reload (manifest, init, fragments).
+            if (!requestUrl.includes('_cb=')) {
+              xhr.open(xhr.readyState === 0 ? 'GET' : xhr._method, bust(requestUrl), true);
+            }
+            xhr.setRequestHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            xhr.setRequestHeader('Pragma', 'no-cache');
+          },
+        });
         hls.on(Hls.Events.ERROR, (_e, d) => {
           statusEl.classList.add('err');
           statusEl.textContent = `${d.type} / ${d.details}${d.reason ? ' — ' + d.reason : ''}`;
@@ -86,10 +107,10 @@
         hls.on(Hls.Events.FRAG_LOADED, (_e, d) => {
           statusEl.textContent = `seg ${d.frag.sn} loaded (${d.frag.duration.toFixed(2)}s)`;
         });
-        hls.loadSource(url);
+        hls.loadSource(bust(url));
         hls.attachMedia(mediaEl);
       } else if (mediaEl.canPlayType('application/vnd.apple.mpegurl')) {
-        mediaEl.src = url;
+        mediaEl.src = bust(url);
         statusEl.textContent = 'native HLS';
       } else {
         statusEl.classList.add('err');
