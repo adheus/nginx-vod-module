@@ -373,6 +373,15 @@ typedef struct {
 	time_t time;
 #endif
 	vod_audio_encoder_state_shuttle_t* audio_encoder_state_shuttle;
+
+	// Phase 14: per-request audio decoder pre-roll. When > 0, the HLS
+	// handler has requested that each audio decoder warm up with this
+	// many extra samples of content BEFORE the segment's clip_from,
+	// with the extra samples discarded at the decoder→buffersrc
+	// boundary so the encoder sees only [seg_start, seg_end] PCM and
+	// EXTINF stays accurate. Set by ngx_http_vod on per-segment audio
+	// requests; zero on seg-1 (no prior content) or non-segment requests.
+	uint32_t audio_preroll_samples;
 } request_context_t;
 
 enum {
