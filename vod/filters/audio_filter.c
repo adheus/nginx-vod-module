@@ -1457,6 +1457,15 @@ audio_filter_read_filter_sink(audio_filter_state_t* state)
 	size_t data_size;
 #endif // AUDIO_FILTER_DEBUG
 
+	// Phase 25 probe: count how many filtered_frames have reached the
+	// encoder for THIS state instance. The first frame of a
+	// state-restored segment is where divergence-from-continuous would
+	// manifest if the filter-graph rebuild (fresh amix/aresample) has
+	// sub-perceptible numerical drift. Log its first 8 L-channel
+	// samples so we can diff them against the continuous-encode
+	// reference at the same absolute timeline position.
+	static int phase25_frames_seen_global = 0;  /* not thread-safe, diagnostic only */
+
 	for (;;)
 	{
 		avrc = av_buffersink_get_frame_flags(state->sink.buffer_sink, state->filtered_frame, AV_BUFFERSINK_FLAG_NO_REQUEST);
@@ -1470,6 +1479,43 @@ audio_filter_read_filter_sink(audio_filter_state_t* state)
 			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
 				"audio_filter_read_filter_sink: av_buffersink_get_frame_flags failed %d", avrc);
 			return VOD_UNEXPECTED;
+		}
+
+		// Phase 25 probe: log first-frame sample values every N frames.
+		// With N==1 we flood the log; with N==172 (one per 4s seg) we
+		// capture just the first frame of each segment. Pick a value
+		// that covers the typical per-request frame count (~172 for 4s
+		// at 44.1kHz / 1024-sample AAC frames).
+		//
+		// nginx's vod_log_error printf subset doesn't support %e or %g,
+		// so we log IEEE 754 float32 bit patterns as hex u32. The
+		// receiver (python) can reinterpret these as floats to diff
+		// against the continuous-encode reference at the same absolute
+		// timeline position.
+		phase25_frames_seen_global++;
+		if (phase25_frames_seen_global <= 4 ||
+		    (phase25_frames_seen_global - 1) % 172 == 0)
+		{
+			if (state->filtered_frame->format == AV_SAMPLE_FMT_FLTP &&
+			    state->filtered_frame->data[0] != NULL)
+			{
+				float* L = (float*)state->filtered_frame->data[0];
+				uint32_t b[8];
+				int i;
+				for (i = 0; i < 8; i++)
+				{
+					uint32_t tmp;
+					memcpy(&tmp, &L[i], 4);
+					b[i] = tmp;
+				}
+				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+					"phase25_sink: frame_idx=%d nb_samples=%d pts=%L "
+					"L_hex=%08xD,%08xD,%08xD,%08xD,%08xD,%08xD,%08xD,%08xD",
+					phase25_frames_seen_global - 1,
+					state->filtered_frame->nb_samples,
+					(long long)state->filtered_frame->pts,
+					b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+			}
 		}
 
 #ifdef AUDIO_FILTER_DEBUG
