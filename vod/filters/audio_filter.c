@@ -103,10 +103,6 @@ typedef struct
 	audio_decoder_state_t decoder;
 	AVFilterContext *buffer_src;
 	bool_t buffersrc_flushed;
-	// Phase 14: remaining samples to drop at the decoder→buffersrc
-	// boundary. Decremented by audio_filter_process_frame until it
-	// reaches zero, at which point real content reaches the graph.
-	uint32_t preroll_samples_remaining;
 } audio_filter_source_t;
 
 typedef struct
@@ -659,14 +655,6 @@ audio_filter_init_sources_and_graph_desc(audio_filter_init_context_t* state, med
 		{
 			return rc;
 		}
-
-		// Phase 14: seed the pre-roll discard counter from
-		// request_context. Each source gets its own counter; they're
-		// independent (amix will receive aligned-post-preroll frames
-		// from all inputs because every source burns through the same
-		// number of pre-roll samples at the same PCM-time-base rate).
-		cur_source->preroll_samples_remaining =
-			state->request_context->audio_preroll_samples;
 
 		vod_sprintf(filter_name, "%uD%Z", clip->id);
 
@@ -1550,77 +1538,26 @@ audio_filter_read_filter_sink(audio_filter_state_t* state)
 	return VOD_OK;
 }
 
-static vod_status_t
+static vod_status_t 
 audio_filter_process_frame(audio_filter_state_t* state, AVFrame* frame)
 {
 	audio_filter_source_t* source = state->cur_source;
 	int avrc;
 
-	// Phase 14: decoder pre-roll discard. Drop or slice the leading
-	// preroll_samples_remaining samples of each decoded frame BEFORE
-	// they reach the buffersrc, so the decoder's cold-start transient
-	// is absorbed inside the decoder's own MDCT warm-up and the filter
-	// graph sees only clean content from the segment's actual start.
-	// Assumes AV_SAMPLE_FMT_FLTP (native AAC decoder default for stereo).
-	if (source->preroll_samples_remaining > 0)
-	{
-		uint32_t drop = source->preroll_samples_remaining;
-		if (drop >= (uint32_t)frame->nb_samples)
-		{
-			// Entire frame is pre-roll — drop it.
-			source->preroll_samples_remaining -= frame->nb_samples;
-			vod_log_debug2(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
-				"audio_filter_process_frame: dropped %d preroll samples "
-				"(remaining=%uD)",
-				frame->nb_samples, source->preroll_samples_remaining);
-			return VOD_OK;
-		}
-
-		// Partial drop: advance planar data pointers by `drop` samples
-		// worth of float32, reduce nb_samples, advance pts. Each channel
-		// plane is independent in FLTP.
-		if (frame->format == AV_SAMPLE_FMT_FLTP)
-		{
-			int nb_channels;
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 23, 100)
-			nb_channels = frame->ch_layout.nb_channels;
-#else
-			nb_channels = frame->channels;
-#endif
-			for (int ch = 0; ch < nb_channels && frame->data[ch] != NULL; ch++)
-			{
-				frame->data[ch] += drop * sizeof(float);
-			}
-			frame->nb_samples -= (int)drop;
-			frame->pts += drop;
-			source->preroll_samples_remaining = 0;
-			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
-				"audio_filter_process_frame: sliced %uD preroll samples, "
-				"passing rest to buffersrc", drop);
-		}
-		else
-		{
-			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-				"audio_filter_process_frame: unsupported sample format %d "
-				"for preroll slice, passing frame through", frame->format);
-			source->preroll_samples_remaining = 0;
-		}
-	}
-
 #ifdef AUDIO_FILTER_DEBUG
 	size_t data_size;
 
 	data_size = av_samples_get_buffer_size(
-		NULL,
+		NULL, 
 		frame->channels,
 		frame->nb_samples,
 		frame->format,
 		1);
 	audio_filter_append_debug_data(source->buffer_src->name, "pcm", frame->data[0], data_size);
 #endif // AUDIO_FILTER_DEBUG
-
+	
 	avrc = av_buffersrc_add_frame_flags(source->buffer_src, frame, AV_BUFFERSRC_FLAG_PUSH);
-	if (avrc < 0)
+	if (avrc < 0) 
 	{
 		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
 			"audio_filter_process_frame: av_buffersrc_add_frame_flags failed %d", avrc);
