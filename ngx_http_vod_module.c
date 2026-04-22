@@ -1736,6 +1736,43 @@ ngx_http_vod_init_parse_params_frames(
 		parse_params->range->end = (parse_params->range->end * rate.num) / rate.denom;
 	}
 
+	// Phase 14: extend the clip window backward by preroll_ms so the
+	// audio decoder sees N pre-roll frames before the real segment
+	// start. The audio_filter.process_frame discard pairs with this to
+	// eat the pre-roll before it reaches the buffersrc, keeping EXTINF
+	// accurate. media_set.segment_start_time already reflects the
+	// unshifted segment boundary (set above), so downstream consumers
+	// that report segment timing remain correct.
+	//
+	// Limitation: applies to range->start unconditionally, which for
+	// video-bearing muxed segments would also extend the video decode
+	// window. All three Phase 12 validation streams (song_full,
+	// mt_audio_only, mt_guitars_plus_vocals) are audio-only so this is
+	// safe. mt_full (video+audio) needs a per-track mechanism —
+	// deferred.
+	if (ctx->submodule_context.request_context.audio_preroll_samples > 0 &&
+		parse_params->range->timescale > 0)
+	{
+		uint64_t preroll_ms =
+			(uint64_t)ctx->submodule_context.request_context.audio_preroll_samples
+			* 1000 / 44100;
+		if (parse_params->range->start > preroll_ms)
+		{
+			parse_params->range->start -= preroll_ms;
+		}
+		else
+		{
+			// seg-2 on a short track — pre-roll can't underflow. Clamp
+			// to 0 and adjust the decoder's preroll counter to only
+			// discard what we actually requested.
+			uint32_t available_samples = (uint32_t)(
+				parse_params->range->start * 44100 / 1000);
+			ctx->submodule_context.request_context.audio_preroll_samples =
+				available_samples;
+			parse_params->range->start = 0;
+		}
+	}
+
 	return NGX_OK;
 }
 
@@ -4080,6 +4117,33 @@ ngx_http_vod_encoder_state_wire_shuttle(ngx_http_vod_ctx_t* ctx)
 		= &ctx->audio_state_shuttle;
 }
 
+// Phase 14: decoder pre-roll amount for the current request. Activated
+// only on audio-bearing segment requests (segment_index > 0; seg-1 has
+// no prior content to pre-roll from). Two AAC frames (2048 samples)
+// gives a 2× margin over the 1-frame convergence empirically observed
+// in phase14_decoder_warmup_probe. Gated on the encoder_state_location
+// being set — without stateful audio, there's no segment-to-segment
+// continuity anyway, and pre-roll gives nothing.
+#define VOD_AUDIO_PREROLL_FRAMES 2
+#define VOD_AUDIO_PREROLL_SAMPLES (VOD_AUDIO_PREROLL_FRAMES * 1024)
+
+static void
+ngx_http_vod_wire_audio_preroll(ngx_http_vod_ctx_t* ctx)
+{
+	ngx_http_vod_loc_conf_t* conf = ctx->submodule_context.conf;
+	uint32_t seg_index = ctx->submodule_context.request_params.segment_index;
+
+	if (conf->encoder_state_location.len == 0 ||
+		seg_index == INVALID_SEGMENT_INDEX ||
+		seg_index == 0)
+	{
+		ctx->submodule_context.request_context.audio_preroll_samples = 0;
+		return;
+	}
+	ctx->submodule_context.request_context.audio_preroll_samples =
+		VOD_AUDIO_PREROLL_SAMPLES;
+}
+
 #endif // NGX_HAVE_LIB_AV_CODEC
 
 static ngx_int_t
@@ -4261,6 +4325,7 @@ ngx_http_vod_run_state_machine(ngx_http_vod_ctx_t *ctx)
 				output_codec_id == VOD_CODEC_ID_AAC)
 			{
 				ngx_http_vod_encoder_state_wire_shuttle(ctx);
+				ngx_http_vod_wire_audio_preroll(ctx);
 				ctx->state = STATE_GET_ENCODER_STATE;
 				rc = ngx_http_vod_encoder_state_get(ctx);
 				if (rc == NGX_AGAIN)
