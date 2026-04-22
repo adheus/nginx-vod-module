@@ -317,11 +317,40 @@ audio_encoder_flush(
 	vod_status_t rc;
 	int avrc;
 
+	// Phase 23 Candidate A probe: capture state BEFORE drain so we can
+	// diff against the post-drain state to see if drain itself mutates
+	// any atom values. If so, the mutated atoms are what cause the
+	// sub-perceptible boundary blip — state captured at post-drain
+	// holds a future-shifted psy snapshot vs what continuous encoder
+	// has at the same timeline position.
+#if VOD_HAVE_ENCODER_STATE_API
+	uint8_t* pre_drain_blob = NULL;
+	size_t   pre_drain_sz = 0;
+	if (state->state_out_data != NULL && state->state_out_size != NULL)
+	{
+		int prc = avcodec_get_encoder_state(state->encoder,
+			&pre_drain_blob, &pre_drain_sz);
+		if (prc == 0 && pre_drain_blob != NULL)
+		{
+			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+				"phase23_probe: pre-drain state captured (%uz bytes)",
+				pre_drain_sz);
+		}
+		else
+		{
+			pre_drain_blob = NULL; pre_drain_sz = 0;
+		}
+	}
+#endif
+
 	avrc = avcodec_send_frame(state->encoder, NULL);
 	if (avrc < 0)
 	{
 		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
 			"audio_encoder_flush: avcodec_send_frame failed %d", avrc);
+#if VOD_HAVE_ENCODER_STATE_API
+		if (pre_drain_blob != NULL) av_free(pre_drain_blob);
+#endif
 		return VOD_UNEXPECTED;
 	}
 
@@ -329,6 +358,9 @@ audio_encoder_flush(
 	if (output_packet == NULL) {
 		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
 			"audio_encoder_flush: av_packet_alloc failed");
+#if VOD_HAVE_ENCODER_STATE_API
+		if (pre_drain_blob != NULL) av_free(pre_drain_blob);
+#endif
 		return VOD_ALLOC_FAILED;
 	}
 
@@ -346,6 +378,9 @@ audio_encoder_flush(
 			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
 				"audio_encoder_flush: avcodec_receive_packet failed %d", avrc);
 			av_packet_free(&output_packet);
+#if VOD_HAVE_ENCODER_STATE_API
+			if (pre_drain_blob != NULL) av_free(pre_drain_blob);
+#endif
 			return VOD_UNEXPECTED;
 		}
 
@@ -354,6 +389,9 @@ audio_encoder_flush(
 		if (rc != VOD_OK)
 		{
 			av_packet_free(&output_packet);
+#if VOD_HAVE_ENCODER_STATE_API
+			if (pre_drain_blob != NULL) av_free(pre_drain_blob);
+#endif
 			return rc;
 		}
 	}
@@ -371,6 +409,74 @@ audio_encoder_flush(
 		int      grc = avcodec_get_encoder_state(state->encoder, &blob, &blob_sz);
 		if (grc == 0 && blob != NULL && blob_sz > 0)
 		{
+			// Phase 23 Candidate A probe: find first and last byte offsets
+			// where pre-drain and post-drain blobs differ. Blobs are the
+			// same wire format so differing byte ranges map to differing
+			// atoms. Log offset + length + hex snippet to identify which
+			// atom is being mutated by drain.
+			if (pre_drain_blob != NULL && pre_drain_sz == blob_sz)
+			{
+				size_t first_diff = blob_sz;
+				size_t last_diff = 0;
+				size_t diff_count = 0;
+				for (size_t i = 0; i < blob_sz; i++)
+				{
+					if (pre_drain_blob[i] != blob[i])
+					{
+						if (first_diff == blob_sz) first_diff = i;
+						last_diff = i;
+						diff_count++;
+					}
+				}
+				if (diff_count == 0)
+				{
+					vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+						"phase23_probe: post-drain blob IDENTICAL to pre-drain "
+						"(Candidate A REJECTED — drain does not mutate state)");
+				}
+				else
+				{
+					// Dump the actual byte values at the diff region so we
+					// can identify which atom is being mutated. Expand the
+					// window backward by 8 bytes to catch the preceding
+					// atom's type/length header.
+					size_t ctx_start = first_diff > 8 ? first_diff - 8 : 0;
+					size_t ctx_end = last_diff + 1 < blob_sz ? last_diff + 1 : blob_sz;
+					char pre_hex[256], post_hex[256];
+					int pre_off = 0, post_off = 0;
+					for (size_t i = ctx_start; i < ctx_end && pre_off < 240; i++)
+					{
+						pre_off += snprintf(pre_hex + pre_off, sizeof(pre_hex) - pre_off,
+							"%02x", pre_drain_blob[i]);
+						post_off += snprintf(post_hex + post_off, sizeof(post_hex) - post_off,
+							"%02x", blob[i]);
+						if ((i - ctx_start + 1) % 4 == 0 && i + 1 < ctx_end)
+						{
+							pre_off += snprintf(pre_hex + pre_off, sizeof(pre_hex) - pre_off, " ");
+							post_off += snprintf(post_hex + post_off, sizeof(post_hex) - post_off, " ");
+						}
+					}
+					vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+						"phase23_probe: drain MUTATED %uz bytes at [%uz..%uz] in %uz-byte blob",
+						diff_count, first_diff, last_diff, blob_sz);
+					vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+						"phase23_probe: pre  bytes[%uz..%uz]: %s",
+						ctx_start, ctx_end, pre_hex);
+					vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+						"phase23_probe: post bytes[%uz..%uz]: %s",
+						ctx_start, ctx_end, post_hex);
+				}
+			}
+			else if (pre_drain_blob != NULL)
+			{
+				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+					"phase23_probe: blob size changed pre=%uz post=%uz — "
+					"drain added/removed atoms",
+					pre_drain_sz, blob_sz);
+			}
+			if (pre_drain_blob != NULL) av_free(pre_drain_blob);
+			pre_drain_blob = NULL;
+
 			*state->state_out_data = blob;
 			*state->state_out_size = blob_sz;
 			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
@@ -389,6 +495,10 @@ audio_encoder_flush(
 		*state->state_out_size = 0;
 #endif
 	}
+
+#if VOD_HAVE_ENCODER_STATE_API
+	if (pre_drain_blob != NULL) av_free(pre_drain_blob);
+#endif
 
 	return VOD_OK;
 }
