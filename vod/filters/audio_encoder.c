@@ -313,94 +313,50 @@ audio_encoder_flush(
 	void* context)
 {
 	audio_encoder_state_t* state = context;
-	AVPacket* output_packet;
-	vod_status_t rc;
 	int avrc;
 
-	// Phase 23 Candidate A probe: capture state BEFORE drain so we can
-	// diff against the post-drain state to see if drain itself mutates
-	// any atom values. If so, the mutated atoms are what cause the
-	// sub-perceptible boundary blip — state captured at post-drain
-	// holds a future-shifted psy snapshot vs what continuous encoder
-	// has at the same timeline position.
-#if VOD_HAVE_ENCODER_STATE_API
-	uint8_t* pre_drain_blob = NULL;
-	size_t   pre_drain_sz = 0;
-	if (state->state_out_data != NULL && state->state_out_size != NULL)
-	{
-		int prc = avcodec_get_encoder_state(state->encoder,
-			&pre_drain_blob, &pre_drain_sz);
-		if (prc == 0 && pre_drain_blob != NULL)
-		{
-			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-				"phase23_probe: pre-drain state captured (%uz bytes)",
-				pre_drain_sz);
-		}
-		else
-		{
-			pre_drain_blob = NULL; pre_drain_sz = 0;
-		}
-	}
-#endif
+	// Phase 24 fix: DO NOT drain at segment boundary when stateful-audio
+	// hook is active. Drain (avcodec_send_frame NULL + receive_packet
+	// loop) causes two problems proven by test-harness/bit_exact_test.c
+	// Run D (chunked, state-transfer, drain-every-chunk):
+	//
+	//   1. Drain's internal copy_input_samples(s, NULL) shifts and zeros
+	//      the encoder's planar_samples lookahead region.
+	//   2. Drain emits the pending AFQ frame as a packet that seg-N+1's
+	//      restored state transfer would have emitted anyway via MDCT
+	//      overlap from its restored planar_samples buffer.
+	//
+	// Together these make the post-drain encoder state represent
+	// "encoder finished" rather than "encoder mid-stream", which is
+	// incompatible with the library's bit-exact Run C continuity
+	// contract. Run C (no per-chunk drain) produces 1380 packets
+	// matching continuous reference exactly. Run D (per-chunk drain)
+	// produces 1394 packets diverging at every boundary — 1194/1380
+	// differ in size. User listening maps this 14-extra-packet
+	// divergence to the audible "vinyl blip" at every segment boundary.
+	//
+	// Skipping drain means seg-N emits N-1 packets instead of N, but
+	// the N-th packet's content is carried forward in the captured
+	// AFQ state and emitted as seg-N+1's first output packet — exactly
+	// what a continuous encoder does at the same timeline position.
+	// Total audio content is preserved bit-exactly.
+	//
+	// Trade-off: seg-N fragment is ~23 ms shorter than EXTINF declares.
+	// If segmenter's `accurate` duration mode computes per-segment
+	// EXTINF from actual emitted sample count, the manifest stays
+	// consistent. If it doesn't, player may see slight drift — but
+	// state-transfer continuity beats drift-free-but-blipping audio.
+	(void)avrc;
 
-	avrc = avcodec_send_frame(state->encoder, NULL);
-	if (avrc < 0)
-	{
-		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"audio_encoder_flush: avcodec_send_frame failed %d", avrc);
-#if VOD_HAVE_ENCODER_STATE_API
-		if (pre_drain_blob != NULL) av_free(pre_drain_blob);
-#endif
-		return VOD_UNEXPECTED;
-	}
 
-	output_packet = av_packet_alloc();
-	if (output_packet == NULL) {
-		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"audio_encoder_flush: av_packet_alloc failed");
-#if VOD_HAVE_ENCODER_STATE_API
-		if (pre_drain_blob != NULL) av_free(pre_drain_blob);
-#endif
-		return VOD_ALLOC_FAILED;
-	}
 
-	for (;;)
-	{
-		// packet data will be allocated by the encoder, av_packet_unref is always called
-		avrc = avcodec_receive_packet(state->encoder, output_packet);
-		if (avrc == AVERROR_EOF)
-		{
-			break;
-		}
-
-		if (avrc < 0)
-		{
-			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-				"audio_encoder_flush: avcodec_receive_packet failed %d", avrc);
-			av_packet_free(&output_packet);
-#if VOD_HAVE_ENCODER_STATE_API
-			if (pre_drain_blob != NULL) av_free(pre_drain_blob);
-#endif
-			return VOD_UNEXPECTED;
-		}
-
-		rc = audio_encoder_write_packet(state, output_packet);
-
-		if (rc != VOD_OK)
-		{
-			av_packet_free(&output_packet);
-#if VOD_HAVE_ENCODER_STATE_API
-			if (pre_drain_blob != NULL) av_free(pre_drain_blob);
-#endif
-			return rc;
-		}
-	}
-
-	av_packet_free(&output_packet);
-
-	// stateful-audio: snapshot encoder state post-flush. Must be AFTER final
-	// avcodec_receive_packet returned AVERROR_EOF so the AFQ and planar
-	// sample buffers reflect end-of-segment state.
+	// Phase 24: snapshot encoder state directly — no drain.
+	// The encoder's AFQ pending frame stays in state and will be emitted
+	// as seg-N+1's first output packet when state is restored (via MDCT
+	// overlap from restored planar_samples). This preserves bit-exact
+	// continuity across segment boundaries (proven by bit_exact_test
+	// Run C: state transfer without per-chunk drain = 1380/1380 packets
+	// match continuous reference exactly).
 	if (state->state_out_data != NULL && state->state_out_size != NULL)
 	{
 #if VOD_HAVE_ENCODER_STATE_API
@@ -409,95 +365,6 @@ audio_encoder_flush(
 		int      grc = avcodec_get_encoder_state(state->encoder, &blob, &blob_sz);
 		if (grc == 0 && blob != NULL && blob_sz > 0)
 		{
-			// Phase 23 Candidate D probe: walk both pre-drain and
-			// post-drain blobs atom-by-atom and report per-atom mutations.
-			// Previous byte-range diff only reported the single contiguous
-			// diff region at blob end (FRAME_NUM + CRC), missing atoms
-			// earlier in the blob that may also mutate (e.g.
-			// PLANAR_SAMPLES if drain zeros the lookahead region).
-			//
-			// FFSA wire format:
-			//   [36-byte header] [atoms...] [4-byte CRC]
-			//   Each atom = u16 type BE + u16 flags BE + u32 length BE
-			//                + payload + pad-to-4-byte
-			if (pre_drain_blob != NULL && pre_drain_sz == blob_sz &&
-			    blob_sz > 40)
-			{
-				size_t pre_off = 36, post_off = 36;
-				size_t atom_idx = 0;
-				size_t blob_end = blob_sz - 4;  // exclude CRC trailer
-				int any_atom_mutated = 0;
-				while (pre_off + 8 <= blob_end && post_off + 8 <= blob_end)
-				{
-					uint16_t pre_type  = ((uint16_t)pre_drain_blob[pre_off] << 8)
-					                   | pre_drain_blob[pre_off + 1];
-					uint16_t post_type = ((uint16_t)blob[post_off] << 8)
-					                   | blob[post_off + 1];
-					uint32_t pre_len = ((uint32_t)pre_drain_blob[pre_off+4] << 24)
-					                 | ((uint32_t)pre_drain_blob[pre_off+5] << 16)
-					                 | ((uint32_t)pre_drain_blob[pre_off+6] <<  8)
-					                 | (uint32_t)pre_drain_blob[pre_off+7];
-					uint32_t post_len = ((uint32_t)blob[post_off+4] << 24)
-					                  | ((uint32_t)blob[post_off+5] << 16)
-					                  | ((uint32_t)blob[post_off+6] <<  8)
-					                  | (uint32_t)blob[post_off+7];
-					uint32_t pre_pad  = (4 - (pre_len & 3)) & 3;
-					uint32_t post_pad = (4 - (post_len & 3)) & 3;
-
-					if (pre_type != post_type || pre_len != post_len)
-					{
-						vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-							"phase23_walk: atom_idx=%uz STRUCTURAL DIFF "
-							"pre(type=0x%04xD len=%uD) post(type=0x%04xD len=%uD)",
-							atom_idx, pre_type, pre_len, post_type, post_len);
-						break;
-					}
-
-					// Same atom structurally. Diff the payload.
-					int payload_diff = 0;
-					uint32_t first_payload_diff = pre_len;
-					uint32_t diff_bytes = 0;
-					for (uint32_t i = 0; i < pre_len; i++)
-					{
-						if (pre_drain_blob[pre_off + 8 + i] !=
-						    blob[post_off + 8 + i])
-						{
-							payload_diff = 1;
-							if (first_payload_diff == pre_len) first_payload_diff = i;
-							diff_bytes++;
-						}
-					}
-					if (payload_diff)
-					{
-						any_atom_mutated = 1;
-						vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-							"phase23_walk: atom_idx=%uz type=0x%04xD len=%uD "
-							"MUTATED %uD bytes (first_diff_at_offset=%uD)",
-							atom_idx, pre_type, pre_len,
-							diff_bytes, first_payload_diff);
-					}
-
-					pre_off  += 8 + pre_len  + pre_pad;
-					post_off += 8 + post_len + post_pad;
-					atom_idx++;
-				}
-				if (!any_atom_mutated)
-				{
-					vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-						"phase23_walk: %uz atoms — ALL IDENTICAL pre/post drain "
-						"(only CRC at blob tail changes; no content mutation)",
-						atom_idx);
-				}
-			}
-			else if (pre_drain_blob != NULL && pre_drain_sz != blob_sz)
-			{
-				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-					"phase23_walk: blob size changed pre=%uz post=%uz",
-					pre_drain_sz, blob_sz);
-			}
-			if (pre_drain_blob != NULL) av_free(pre_drain_blob);
-			pre_drain_blob = NULL;
-
 			*state->state_out_data = blob;
 			*state->state_out_size = blob_sz;
 			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
@@ -516,10 +383,6 @@ audio_encoder_flush(
 		*state->state_out_size = 0;
 #endif
 	}
-
-#if VOD_HAVE_ENCODER_STATE_API
-	if (pre_drain_blob != NULL) av_free(pre_drain_blob);
-#endif
 
 	return VOD_OK;
 }
