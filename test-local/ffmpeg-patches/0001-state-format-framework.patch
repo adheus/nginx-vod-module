@@ -282,7 +282,7 @@ new file mode 100644
 index 0000000..7b6184c
 --- /dev/null
 +++ b/libavcodec/state_format.h
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,196 @@
 +/*
 + * FFSA — FFmpeg State Atoms binary format (v1.0)
 + * Private helpers for encoder/filter state serialisation.
@@ -344,6 +344,7 @@ index 0000000..7b6184c
 +#define FFSA_AAC_FRAME_NUM               0x0013
 +#define FFSA_AAC_PSY_CUTOFF              0x0014
 +#define FFSA_AAC_PSY_COEF_MIN_SNR        0x0015
++#define FFSA_AAC_ICS_MAX_SFB             0x0016  /* Phase 27: per-SCE u8, prev-frame clamp value for aacenc.c:934 FFMIN */
 +
 +/* Fixed sizes */
 +#define FFSA_HEADER_SIZE 36

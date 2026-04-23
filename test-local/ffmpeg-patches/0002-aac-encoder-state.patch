@@ -203,7 +203,7 @@ new file mode 100644
 index 0000000..d91b4f6
 --- /dev/null
 +++ b/libavcodec/aacenc_state.c
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,712 @@
 +/*
 + * AAC encoder — state snapshot/restore.
 + *
@@ -609,6 +609,42 @@ index 0000000..d91b4f6
 +                                  FFSA_ATOM_REQUIRED, tmp, 8);
 +    if (ret < 0) goto fail;
 +
++    /* 0x0016 AAC_ICS_MAX_SFB — per-SCE u8 previous-frame max_sfb.
++     * aacenc.c:934 does `ics->max_sfb = FFMIN(ics->max_sfb, ics->num_swb)`
++     * which reads the PRIOR frame's max_sfb before recomputing it inside
++     * adjust_frame_information. Without restoring this, a fresh encoder
++     * always starts with max_sfb=0 which forces the clamp to zero —
++     * downstream TNS (aacenc_tns.c:107,166) and trellis coding
++     * (aaccoder_trellis.h:65) then process zero bands on frame 0 after
++     * restore, producing a divergent packet. Phase 27 identified this
++     * as the sole non-atom cross-frame read-then-write dependency on
++     * real music content. Marked OPTIONAL for backward compat with
++     * blobs written before 2026-04-23. */
++    {
++        int nb_sce = 0;
++        int sce_idx = 0;
++        uint8_t *buf;
++        for (i = 0; i < s->chan_map[0]; i++) {
++            int tag = s->chan_map[i + 1];
++            nb_sce += (tag == TYPE_CPE) ? 2 : 1;
++        }
++        buf = av_malloc(nb_sce);
++        if (!buf) { ret = AVERROR(ENOMEM); goto fail; }
++        for (i = 0; i < s->chan_map[0]; i++) {
++            int tag = s->chan_map[i + 1];
++            int chans = (tag == TYPE_CPE) ? 2 : 1;
++            ChannelElement *cpe = &s->cpe[i];
++            int c;
++            for (c = 0; c < chans; c++)
++                buf[sce_idx++] = cpe->ch[c].ics.max_sfb;
++        }
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AAC_ICS_MAX_SFB,
++                                      0 /* optional for back-compat */,
++                                      buf, nb_sce);
++        av_free(buf);
++        if (ret < 0) goto fail;
++    }
++
 +    ret = ff_ffsa_writer_finish(&w, out_buf, out_size);
 +    if (ret < 0)
 +        goto fail;
@@ -850,6 +886,32 @@ index 0000000..d91b4f6
 +        for (i = 0; i < FF_AACPSY_COEF_MIN_SNR_COUNT; i++)
 +            snr[i] = ff_ffsa_rd_f32be(val + i * 4);
 +        ff_aacpsy_set_coef_min_snr(&s->psy, snr);
++    }
++
++    /* 0x0016 AAC_ICS_MAX_SFB — optional Phase 27 atom. Restore the
++     * prior-frame max_sfb per SCE so that aacenc.c:934 produces the
++     * same clamped value as a continuous encoder would. Blobs written
++     * before 2026-04-23 won't carry this atom; in that case the fresh
++     * encoder keeps max_sfb=0 (legacy behaviour — one subtly-divergent
++     * packet per restore boundary on content that requires non-zero
++     * max_sfb). */
++    if (ff_ffsa_reader_find(&r, FFSA_AAC_ICS_MAX_SFB, &val, &vlen)) {
++        int sce_idx = 0;
++        int expected_nb_sce = 0;
++        for (i = 0; i < s->chan_map[0]; i++) {
++            int tag = s->chan_map[i + 1];
++            expected_nb_sce += (tag == TYPE_CPE) ? 2 : 1;
++        }
++        if ((int)vlen == expected_nb_sce) {
++            for (i = 0; i < s->chan_map[0]; i++) {
++                int tag = s->chan_map[i + 1];
++                int chans = (tag == TYPE_CPE) ? 2 : 1;
++                ChannelElement *cpe = &s->cpe[i];
++                int c;
++                for (c = 0; c < chans; c++)
++                    cpe->ch[c].ics.max_sfb = val[sce_idx++];
++            }
++        }
 +    }
 +
 +    return 0;
