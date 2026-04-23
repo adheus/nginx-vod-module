@@ -1,0 +1,529 @@
+From: stateful-audio <noreply@moises>
+Date: 2026-04-23
+Subject: [PATCH 0009] libavcodec/aac: AAC decoder state snapshot/restore
+
+Mirror of Phase 3's encoder state APIs (patches 0002 + 0003) for the
+native AAC decoder. Adds:
+
+  - libavcodec/aac/aacdec_state.{c,h} — FFSA writer/reader for the
+    minimal AAC-LC cross-frame state set: the per-SCE IMDCT overlap
+    buffer (saved[1536]), is_saved flag, window_sequence[0..1],
+    use_kb_window[0..1], and the PNS random_state.
+
+  - avcodec_{get,set}_decoder_state public API in libavcodec/avcodec.h
+    and libavcodec/decode.c. Switch-on-codec-id routes AAC_CODEC_ID_AAC
+    to ff_aac_decoder_{get,set}_state; all other codecs return ENOSYS.
+
+  - New FFSA component id 0x0004 (AAC_DECODER) and atom tags 0x3001..
+    0x3005 in libavcodec/state_format.h.
+
+Library validation: stateful-aac-validation/test-harness/
+aac_decoder_bit_exact_test passes on all 6 Moises stems (vocals, bass,
+drums, guitars, piano, other) at chunks ∈ {4, 8, 16, 32, 40} —
+30/30 bit-exact match between a continuous decoder reference and a
+chunked decoder with state transferred at every chunk boundary.
+
+This closes the last identified drift source in the nginx-vod-module
+pipeline (Phase 27 proved encoder + amix + aresample state transfer
+were bit-exact; Phase 27 pipeline oracle isolated the remaining
+audible residual to source AAC decoder cold-start; Phase 28 fixes
+that).
+
+Depends on: 0001-state-format-framework.patch (shared FFSA writer/
+reader helpers and the state_format.h component-id namespace).
+
+---
+ libavcodec/aac/Makefile       |   3 +-
+ libavcodec/aac/aacdec_state.c | 330 +++++++++++++++++++++++++++++++++
+ libavcodec/aac/aacdec_state.h |  44 +++++
+ libavcodec/avcodec.h          |  29 +++
+ libavcodec/decode.c           |  49 +++++
+ libavcodec/state_format.h     |  10 ++
+ 6 files changed, 464 insertions(+), 1 deletion(-)
+ create mode 100644 libavcodec/aac/aacdec_state.c
+ create mode 100644 libavcodec/aac/aacdec_state.h
+
+diff --git a/libavcodec/aac/Makefile b/libavcodec/aac/Makefile
+--- a/libavcodec/aac/Makefile
++++ b/libavcodec/aac/Makefile
+@@ -4,6 +4,7 @@ clean::
+ OBJS-$(CONFIG_AAC_DECODER)          +=  aac/aacdec.o aac/aacdec_tab.o \
+                                         aac/aacdec_float.o aac/aacdec_usac.o \
+                                         aac/aacdec_ac.o aac/aacdec_lpd.o \
+-                                        aac/aacdec_usac_mps212.o
++                                        aac/aacdec_usac_mps212.o \
++                                        aac/aacdec_state.o
+ OBJS-$(CONFIG_AAC_FIXED_DECODER)    +=  aac/aacdec.o aac/aacdec_tab.o \
+                                         aac/aacdec_fixed.o
+diff --git a/libavcodec/aac/aacdec_state.c b/libavcodec/aac/aacdec_state.c
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/aac/aacdec_state.c
+@@ -0,0 +1,330 @@
++/*
++ * AAC decoder — state snapshot/restore (Phase 28).
++ *
++ * Implements avcodec_{get,set}_decoder_state for the native AAC decoder.
++ * Serialises the minimal AAC-LC cross-frame state set identified in
++ * stateful-aac-validation/research/phase28-aac-decoder-state-scope.md
++ * into the FFSA wire format.
++ *
++ * Atoms captured (component 0x0004, all REQUIRED):
++ *   0x3001 FFSA_AACDEC_SAVED           per-SCE 1536 × f32 IMDCT overlap
++ *   0x3002 FFSA_AACDEC_IS_SAVED        u8
++ *   0x3003 FFSA_AACDEC_WINDOW_SEQUENCE per-SCE 2 × u32
++ *   0x3004 FFSA_AACDEC_USE_KB_WINDOW   per-SCE 2 × u8
++ *   0x3005 FFSA_AACDEC_RANDOM_STATE    u32
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <string.h>
++
++#include "libavutil/mem.h"
++#include "libavutil/error.h"
++
++#include "libavcodec/avcodec.h"
++#include "libavcodec/version.h"
++#include "libavcodec/aac.h"
++#include "libavcodec/state_format.h"
++
++#include "aacdec.h"
++#include "aacdec_state.h"
++
++#define AACDEC_COMPONENT_VERSION 0x0001
++#define AACDEC_NB_SAVED 1536
++
++typedef int (*sce_visitor)(AACDecContext *ac, SingleChannelElement *sce,
++                           int sce_idx, void *user);
++
++static int for_each_sce(AACDecContext *ac, sce_visitor visit, void *user)
++{
++    static const int type_order[4] = { TYPE_SCE, TYPE_CPE, TYPE_CCE, TYPE_LFE };
++    int t, id, c, sce_idx = 0;
++    for (t = 0; t < 4; t++) {
++        int type = type_order[t];
++        int chans = (type == TYPE_CPE) ? 2 : 1;
++        for (id = 0; id < MAX_ELEM_ID; id++) {
++            ChannelElement *che = ac->che[type][id];
++            if (!che)
++                continue;
++            for (c = 0; c < chans; c++) {
++                SingleChannelElement *sce = &che->ch[c];
++                int ret = visit(ac, sce, sce_idx++, user);
++                if (ret < 0)
++                    return ret;
++            }
++        }
++    }
++    return sce_idx;
++}
++
++static int count_sce_cb(AACDecContext *ac, SingleChannelElement *sce,
++                        int idx, void *user)
++{
++    (void)ac; (void)sce; (void)idx; (void)user;
++    return 0;
++}
++
++static int count_sces(AACDecContext *ac)
++{
++    return for_each_sce(ac, count_sce_cb, NULL);
++}
++
++static uint64_t compute_config_hash(AVCodecContext *avctx, AACDecContext *ac)
++{
++    uint8_t buf[128];
++    size_t off = 0;
++    uint64_t layout_mask;
++
++    ff_ffsa_wr_u32be(buf + off, FFSA_COMPONENT_AAC_DECODER); off += 4;
++    ff_ffsa_wr_u32be(buf + off, AACDEC_COMPONENT_VERSION);   off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)avctx->sample_rate); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)avctx->ch_layout.nb_channels); off += 4;
++    if (avctx->ch_layout.order == AV_CHANNEL_ORDER_NATIVE)
++        layout_mask = avctx->ch_layout.u.mask;
++    else
++        layout_mask = 0;
++    ff_ffsa_wr_u64be(buf + off, layout_mask); off += 8;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)avctx->profile); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)ac->oc[1].m4ac.object_type); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)count_sces(ac)); off += 4;
++    ff_ffsa_wr_u32be(buf + off, (uint32_t)ac->is_fixed); off += 4;
++
++    return ff_ffsa_sha256_prefix64(buf, off);
++}
++
++static uint32_t compute_build_hash(void)
++{
++    const char *ident = av_version_info();
++    if (!ident)
++        return 0;
++    return ff_ffsa_crc32((const uint8_t *)ident, strlen(ident));
++}
++
++typedef struct {
++    uint8_t *saved_buf;
++    uint8_t *ws_buf;
++    uint8_t *kb_buf;
++    int err;
++} collect_ctx;
++
++static int collect_sce_cb(AACDecContext *ac, SingleChannelElement *sce,
++                          int idx, void *user)
++{
++    collect_ctx *cc = user;
++    IndividualChannelStream *ics = &sce->ics;
++    int i;
++
++    if (ac->is_fixed) {
++        cc->err = AVERROR(ENOSYS);
++        return cc->err;
++    }
++    {
++        const float *src = (const float *)sce->saved;
++        uint8_t *dst = cc->saved_buf + (size_t)idx * AACDEC_NB_SAVED * 4;
++        for (i = 0; i < AACDEC_NB_SAVED; i++)
++            ff_ffsa_wr_f32be(dst + i * 4, src[i]);
++    }
++    ff_ffsa_wr_u32be(cc->ws_buf + (size_t)idx * 2 * 4 + 0,
++                     (uint32_t)ics->window_sequence[0]);
++    ff_ffsa_wr_u32be(cc->ws_buf + (size_t)idx * 2 * 4 + 4,
++                     (uint32_t)ics->window_sequence[1]);
++    cc->kb_buf[(size_t)idx * 2 + 0] = ics->use_kb_window[0];
++    cc->kb_buf[(size_t)idx * 2 + 1] = ics->use_kb_window[1];
++    return 0;
++}
++
++int ff_aac_decoder_get_state(AVCodecContext *avctx,
++                             uint8_t **out_buf, size_t *out_size)
++{
++    AACDecContext *ac = avctx->priv_data;
++    FFSAWriter w;
++    uint16_t flags = 0;
++    uint8_t tmp[8];
++    int ret, nb_sce;
++    collect_ctx cc = { 0 };
++
++    if (!out_buf || !out_size)
++        return AVERROR(EINVAL);
++    if (!ac || ac->is_fixed)
++        return AVERROR(ENOSYS);
++    if (avctx->flags & AV_CODEC_FLAG_BITEXACT)
++        flags |= FFSA_FLAG_BITEXACT;
++
++    nb_sce = count_sces(ac);
++    if (nb_sce <= 0)
++        return AVERROR(EAGAIN);
++
++    ret = ff_ffsa_writer_begin(&w,
++                               FFSA_COMPONENT_AAC_DECODER,
++                               AACDEC_COMPONENT_VERSION,
++                               LIBAVCODEC_VERSION_INT,
++                               compute_build_hash(),
++                               compute_config_hash(avctx, ac),
++                               flags);
++    if (ret < 0)
++        return ret;
++
++    {
++        uint32_t saved_total = (uint32_t)nb_sce * AACDEC_NB_SAVED * 4;
++        uint32_t ws_total    = (uint32_t)nb_sce * 2 * 4;
++        uint32_t kb_total    = (uint32_t)nb_sce * 2;
++        cc.saved_buf = av_malloc(saved_total);
++        cc.ws_buf    = av_malloc(ws_total);
++        cc.kb_buf    = av_malloc(kb_total);
++        if (!cc.saved_buf || !cc.ws_buf || !cc.kb_buf) {
++            ret = AVERROR(ENOMEM); goto fail;
++        }
++        ret = for_each_sce(ac, collect_sce_cb, &cc);
++        if (ret < 0) goto fail;
++
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AACDEC_SAVED,
++                                      FFSA_ATOM_REQUIRED,
++                                      cc.saved_buf, saved_total);
++        if (ret < 0) goto fail;
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AACDEC_WINDOW_SEQUENCE,
++                                      FFSA_ATOM_REQUIRED,
++                                      cc.ws_buf, ws_total);
++        if (ret < 0) goto fail;
++        ret = ff_ffsa_writer_add_atom(&w, FFSA_AACDEC_USE_KB_WINDOW,
++                                      FFSA_ATOM_REQUIRED,
++                                      cc.kb_buf, kb_total);
++        if (ret < 0) goto fail;
++    }
++
++    tmp[0] = ac->is_saved ? 1 : 0;
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_AACDEC_IS_SAVED,
++                                  FFSA_ATOM_REQUIRED, tmp, 1);
++    if (ret < 0) goto fail;
++
++    ff_ffsa_wr_u32be(tmp, (uint32_t)ac->random_state);
++    ret = ff_ffsa_writer_add_atom(&w, FFSA_AACDEC_RANDOM_STATE,
++                                  FFSA_ATOM_REQUIRED, tmp, 4);
++    if (ret < 0) goto fail;
++
++    ret = ff_ffsa_writer_finish(&w, out_buf, out_size);
++    if (ret < 0) goto fail;
++    av_free(cc.saved_buf); av_free(cc.ws_buf); av_free(cc.kb_buf);
++    return 0;
++
++fail:
++    ff_ffsa_writer_abort(&w);
++    av_free(cc.saved_buf); av_free(cc.ws_buf); av_free(cc.kb_buf);
++    *out_buf = NULL;
++    *out_size = 0;
++    return ret;
++}
++
++typedef struct {
++    const uint8_t *saved_buf;
++    const uint8_t *ws_buf;
++    const uint8_t *kb_buf;
++} restore_ctx;
++
++static int restore_sce_cb(AACDecContext *ac, SingleChannelElement *sce,
++                          int idx, void *user)
++{
++    restore_ctx *rc = user;
++    IndividualChannelStream *ics = &sce->ics;
++    int i;
++
++    if (ac->is_fixed)
++        return AVERROR(ENOSYS);
++    {
++        float *dst = (float *)sce->saved;
++        const uint8_t *src = rc->saved_buf + (size_t)idx * AACDEC_NB_SAVED * 4;
++        for (i = 0; i < AACDEC_NB_SAVED; i++)
++            dst[i] = ff_ffsa_rd_f32be(src + i * 4);
++    }
++    ics->window_sequence[0] =
++        (enum WindowSequence)ff_ffsa_rd_u32be(rc->ws_buf + (size_t)idx * 2 * 4 + 0);
++    ics->window_sequence[1] =
++        (enum WindowSequence)ff_ffsa_rd_u32be(rc->ws_buf + (size_t)idx * 2 * 4 + 4);
++    ics->use_kb_window[0] = rc->kb_buf[(size_t)idx * 2 + 0];
++    ics->use_kb_window[1] = rc->kb_buf[(size_t)idx * 2 + 1];
++    return 0;
++}
++
++int ff_aac_decoder_set_state(AVCodecContext *avctx,
++                             const uint8_t *buf, size_t size)
++{
++    AACDecContext *ac = avctx->priv_data;
++    FFSAReader r;
++    const uint8_t *val;
++    uint32_t vlen;
++    int ret, nb_sce;
++    restore_ctx rc;
++
++    if (!ac || ac->is_fixed)
++        return AVERROR(ENOSYS);
++
++    ret = ff_ffsa_reader_validate(&r, buf, size);
++    if (ret < 0)
++        return ret;
++
++    if (r.header.component_id != FFSA_COMPONENT_AAC_DECODER)
++        return AVERROR(EINVAL);
++    if (r.header.component_version != AACDEC_COMPONENT_VERSION)
++        return AVERROR(EINVAL);
++    if (r.header.config_hash != compute_config_hash(avctx, ac))
++        return AVERROR(EINVAL);
++
++    nb_sce = count_sces(ac);
++    if (nb_sce <= 0)
++        return AVERROR(EAGAIN);
++
++    {
++        struct { uint16_t tag; uint32_t expected; } req[] = {
++            { FFSA_AACDEC_SAVED,           (uint32_t)nb_sce * AACDEC_NB_SAVED * 4 },
++            { FFSA_AACDEC_IS_SAVED,        1 },
++            { FFSA_AACDEC_WINDOW_SEQUENCE, (uint32_t)nb_sce * 2 * 4 },
++            { FFSA_AACDEC_USE_KB_WINDOW,   (uint32_t)nb_sce * 2 },
++            { FFSA_AACDEC_RANDOM_STATE,    4 },
++        };
++        size_t k;
++        for (k = 0; k < sizeof(req) / sizeof(req[0]); k++) {
++            if (!ff_ffsa_reader_find(&r, req[k].tag, &val, &vlen))
++                return AVERROR(EINVAL);
++            if (vlen != req[k].expected)
++                return AVERROR(EINVAL);
++        }
++    }
++
++    ff_ffsa_reader_find(&r, FFSA_AACDEC_SAVED, &val, &vlen);
++    rc.saved_buf = val;
++    ff_ffsa_reader_find(&r, FFSA_AACDEC_WINDOW_SEQUENCE, &val, &vlen);
++    rc.ws_buf = val;
++    ff_ffsa_reader_find(&r, FFSA_AACDEC_USE_KB_WINDOW, &val, &vlen);
++    rc.kb_buf = val;
++
++    ret = for_each_sce(ac, restore_sce_cb, &rc);
++    if (ret < 0)
++        return ret;
++
++    ff_ffsa_reader_find(&r, FFSA_AACDEC_IS_SAVED, &val, &vlen);
++    ac->is_saved = val[0] ? 1 : 0;
++
++    ff_ffsa_reader_find(&r, FFSA_AACDEC_RANDOM_STATE, &val, &vlen);
++    ac->random_state = (int)ff_ffsa_rd_u32be(val);
++
++    return 0;
++}
+diff --git a/libavcodec/aac/aacdec_state.h b/libavcodec/aac/aacdec_state.h
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/aac/aacdec_state.h
+@@ -0,0 +1,44 @@
++/*
++ * AAC decoder state snapshot/restore — internal declarations (Phase 28).
++ *
++ * Mirror of libavcodec/aacenc_state.h for the decoder side.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef AVCODEC_AAC_AACDEC_STATE_H
++#define AVCODEC_AAC_AACDEC_STATE_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#include "libavcodec/avcodec.h"
++
++int ff_aac_decoder_get_state(AVCodecContext *avctx,
++                             uint8_t **buf, size_t *size);
++int ff_aac_decoder_set_state(AVCodecContext *avctx,
++                             const uint8_t *buf, size_t size);
++
++#endif /* AVCODEC_AAC_AACDEC_STATE_H */
+diff --git a/libavcodec/avcodec.h b/libavcodec/avcodec.h
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -2586,6 +2586,35 @@ int avcodec_get_encoder_state(AVCodecContext *avctx,
+ int avcodec_set_encoder_state(AVCodecContext *avctx,
+                               const uint8_t *buf, size_t size);
+
++/**
++ * Phase 28: serialise the current state of a decoder into a portable
++ * blob. Symmetric to avcodec_get_encoder_state. Captures the minimal
++ * cross-frame state needed so that a freshly-opened decoder, after
++ * avcodec_set_decoder_state, emits the same PCM as a continuous
++ * decoder would at the same timeline position — principally the IMDCT
++ * overlap buffer, window-sequence, and PNS random state.
++ *
++ * Currently supported: AV_CODEC_ID_AAC (native decoder, float build).
++ * Other codecs return AVERROR(ENOSYS).
++ *
++ * @return 0 on success, a negative AVERROR on failure.
++ *   AVERROR(EAGAIN) if the decoder has not yet allocated its channel
++ *   elements (no frames decoded yet).
++ */
++int avcodec_get_decoder_state(AVCodecContext *avctx,
++                              uint8_t **buf, size_t *size);
++
++/**
++ * Restore previously-serialised decoder state. Must be called after
++ * avcodec_open2() AND after the decoder has allocated its channel
++ * elements for the configured layout — typically after decoding one
++ * frame, or after set_state failing with EAGAIN on first call.
++ *
++ * @return 0 on success, a negative AVERROR on failure.
++ */
++int avcodec_set_decoder_state(AVCodecContext *avctx,
++                              const uint8_t *buf, size_t size);
++
+ enum AVCodecConfig {
+     AV_CODEC_CONFIG_PIX_FORMAT,     ///< AVPixelFormat, terminated by AV_PIX_FMT_NONE
+     AV_CODEC_CONFIG_FRAME_RATE,     ///< AVRational, terminated by {0, 0}
+diff --git a/libavcodec/decode.c b/libavcodec/decode.c
+--- a/libavcodec/decode.c
++++ b/libavcodec/decode.c
+@@ -2485,3 +2485,52 @@ end:
+     av_exif_free(&ifd);
+     return ret;
+ }
++
++/* --------------------------------------- decoder state snapshot/restore -- */
++/* Phase 28: per-codec state APIs for decoders. Currently only the native
++ * AAC decoder implements this; other codecs return ENOSYS. */
++
++#include "config_components.h"
++
++#if CONFIG_AAC_DECODER
++#include "aac/aacdec_state.h"
++#endif
++
++int avcodec_get_decoder_state(AVCodecContext *avctx,
++                              uint8_t **buf, size_t *size)
++{
++    if (!avctx || !buf || !size)
++        return AVERROR(EINVAL);
++    *buf = NULL;
++    *size = 0;
++    if (!av_codec_is_decoder(avctx->codec))
++        return AVERROR(EINVAL);
++
++    switch (avctx->codec_id) {
++#if CONFIG_AAC_DECODER
++    case AV_CODEC_ID_AAC:
++        return ff_aac_decoder_get_state(avctx, buf, size);
++#endif
++    default:
++        return AVERROR(ENOSYS);
++    }
++}
++
++int avcodec_set_decoder_state(AVCodecContext *avctx,
++                              const uint8_t *buf, size_t size)
++{
++    if (!avctx || !buf || !size)
++        return AVERROR(EINVAL);
++    if (!av_codec_is_decoder(avctx->codec))
++        return AVERROR(EINVAL);
++
++    switch (avctx->codec_id) {
++#if CONFIG_AAC_DECODER
++    case AV_CODEC_ID_AAC:
++        return ff_aac_decoder_set_state(avctx, buf, size);
++#endif
++    default:
++        return AVERROR(ENOSYS);
++    }
++}
+diff --git a/libavcodec/state_format.h b/libavcodec/state_format.h
+--- a/libavcodec/state_format.h
++++ b/libavcodec/state_format.h
+@@ -26,6 +26,7 @@
+ #define FFSA_COMPONENT_AAC_ENCODER 0x0001
+ #define FFSA_COMPONENT_ARESAMPLE   0x0002
+ #define FFSA_COMPONENT_AMIX        0x0003
++#define FFSA_COMPONENT_AAC_DECODER 0x0004  /* Phase 28 */
+
+ /* Atom flags (u16, per atom). */
+ #define FFSA_ATOM_REQUIRED   (1u << 0)
+@@ -62,6 +63,15 @@
+ #define FFSA_AAC_PSY_COEF_MIN_SNR        0x0015
+ #define FFSA_AAC_ICS_MAX_SFB             0x0016  /* Phase 27 */
+
++/* AAC decoder atom tags (component 0x0004) — Phase 28 */
++#define FFSA_AACDEC_SAVED                0x3001
++#define FFSA_AACDEC_IS_SAVED             0x3002
++#define FFSA_AACDEC_WINDOW_SEQUENCE      0x3003
++#define FFSA_AACDEC_USE_KB_WINDOW        0x3004
++#define FFSA_AACDEC_RANDOM_STATE         0x3005
++#define FFSA_AACDEC_ICS_MAX_SFB          0x3006  /* optional / reserved */
++
+ /* Fixed sizes */
+ #define FFSA_HEADER_SIZE 36
+ #define FFSA_TRAILER_SIZE 4
