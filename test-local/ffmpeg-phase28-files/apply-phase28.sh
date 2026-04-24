@@ -3,7 +3,11 @@
 # that already has patches 0001..0008 applied. Run from the FFmpeg root.
 set -euo pipefail
 
-SRC=/tmp/ffmpeg-phase28-files
+# Source path: default to the script's own directory (so it works when
+# invoked directly from the nginx-vod-module checkout in a container
+# build), but allow override via SRC env var for legacy consumers that
+# still pre-stage the files at /tmp/ffmpeg-phase28-files.
+SRC="${SRC:-$(cd "$(dirname "$0")" && pwd)}"
 
 # 1) Drop the two new source files into libavcodec/aac/.
 cp "$SRC/aacdec_state.c" libavcodec/aac/aacdec_state.c
