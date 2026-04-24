@@ -44,6 +44,15 @@ RUN cd /tmp/ffmpeg && \
     patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0007-avfilter-aresample-state-route.patch && \
     patch -p1 --fuzz=5 -F 99 < /tmp/ffmpeg-patches/0008-amix-post-eof-input-state-clamp.patch
 
+# Phase 28: drop new decoder-state source files + apply inline edits via a
+# helper script. Avoids the fragility of line-numbered patch hunks against
+# FFmpeg master HEAD.
+COPY test-local/ffmpeg-phase28-files/aacdec_state.c \
+     test-local/ffmpeg-phase28-files/aacdec_state.h \
+     test-local/ffmpeg-phase28-files/apply-phase28.sh \
+     /tmp/ffmpeg-phase28-files/
+RUN cd /tmp/ffmpeg && /bin/bash /tmp/ffmpeg-phase28-files/apply-phase28.sh
+
 # Minimal build — native AAC encoder only (no libfdk_aac). Mirrors the subset
 # that nginx-vod-module actually needs for HLS audio muxing.
 RUN cd /tmp/ffmpeg && \

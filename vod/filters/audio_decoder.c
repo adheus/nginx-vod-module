@@ -1,5 +1,22 @@
 #include "audio_decoder.h"
 
+// Phase 28: compile-time probe for avcodec_{get,set}_decoder_state —
+// added in 2026-04-23 (patch 0009-aac-decoder-state.patch). Same idea
+// as VOD_HAVE_ENCODER_STATE_API in audio_encoder.c.
+#if defined(LIBAVCODEC_VERSION_INT) && \
+    LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(62, 30, 100)
+#define VOD_HAVE_DECODER_STATE_API 1
+#else
+#define VOD_HAVE_DECODER_STATE_API 0
+#endif
+
+#if VOD_HAVE_DECODER_STATE_API
+extern int avcodec_get_decoder_state(AVCodecContext *avctx,
+                                     uint8_t **buf, size_t *size);
+extern int avcodec_set_decoder_state(AVCodecContext *avctx,
+                                     const uint8_t *buf, size_t size);
+#endif
+
 // globals
 static const AVCodec *decoder_codec = NULL;
 static bool_t initialized = FALSE;
@@ -145,6 +162,13 @@ audio_decoder_init(
 	state->frame_started = FALSE;
 	state->frame_buffer = NULL;
 
+	// Phase 28: initialise state-in fields to "no pending restore".
+	// audio_filter_restore_state will overwrite these in-place if the
+	// transport carries a matching decoder blob for this source.
+	state->state_in_data = NULL;
+	state->state_in_size = 0;
+	state->state_restored = 0;
+
 	state->cur_frame_part = track->frames;
 	state->cur_frame = track->frames.first_frame;
 	state->dts = track->first_frame_time_offset;
@@ -165,37 +189,40 @@ audio_decoder_free(audio_decoder_state_t* state)
 	av_frame_free(&state->decoded_frame);
 }
 
+// Send one packet into the decoder and try to receive one frame. Shared
+// between the regular decode path and the Phase 28 warm-up-and-re-decode
+// dance. `buffer` must remain valid for the duration of the call.
 static vod_status_t
-audio_decoder_decode_frame(
+audio_decoder_send_and_receive(
 	audio_decoder_state_t* state,
 	u_char* buffer,
-	AVFrame** result)
+	uint32_t size,
+	int64_t dts,
+	int64_t pts,
+	uint32_t duration,
+	int* out_avrc)
 {
-	input_frame_t* frame = state->cur_frame;
-	AVPacket* input_packet;
+	AVPacket* input_packet = av_packet_alloc();
 	u_char original_pad[VOD_BUFFER_PADDING_SIZE];
 	u_char* frame_end;
 	int avrc;
 
-	input_packet = av_packet_alloc();
 	if (input_packet == NULL) {
 		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"audio_decoder_decode_frame: av_packet_alloc failed");
+			"audio_decoder_send_and_receive: av_packet_alloc failed");
 		return VOD_ALLOC_FAILED;
 	}
 
-	// send a frame
 	input_packet->data = buffer;
-	input_packet->size = frame->size;
-	input_packet->dts = state->dts;
-	input_packet->pts = state->dts + frame->pts_delay;
-	input_packet->duration = frame->duration;
+	input_packet->size = size;
+	input_packet->dts = dts;
+	input_packet->pts = pts;
+	input_packet->duration = duration;
 	input_packet->flags = AV_PKT_FLAG_KEY;
-	state->dts += frame->duration;
 
 	av_frame_unref(state->decoded_frame);
 
-	frame_end = buffer + frame->size;
+	frame_end = buffer + size;
 	vod_memcpy(original_pad, frame_end, sizeof(original_pad));
 	vod_memzero(frame_end, sizeof(original_pad));
 
@@ -203,9 +230,41 @@ audio_decoder_decode_frame(
 	av_packet_free(&input_packet);
 	if (avrc < 0)
 	{
+		vod_memcpy(frame_end, original_pad, sizeof(original_pad));
+		*out_avrc = avrc;
 		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"audio_decoder_decode_frame: avcodec_send_packet failed %d", avrc);
+			"audio_decoder_send_and_receive: avcodec_send_packet failed %d", avrc);
 		return VOD_BAD_DATA;
+	}
+
+	avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
+	vod_memcpy(frame_end, original_pad, sizeof(original_pad));
+	*out_avrc = avrc;
+	return VOD_OK;
+}
+
+static vod_status_t
+audio_decoder_decode_frame(
+	audio_decoder_state_t* state,
+	u_char* buffer,
+	AVFrame** result)
+{
+	input_frame_t* frame = state->cur_frame;
+	uint32_t frame_size     = frame->size;
+	uint32_t frame_duration = frame->duration;
+	int64_t frame_dts       = (int64_t)state->dts;
+	int64_t frame_pts       = (int64_t)state->dts + frame->pts_delay;
+	int avrc;
+	vod_status_t rc;
+
+	// Advance stream pos — matches legacy behaviour.
+	state->dts += frame->duration;
+
+	rc = audio_decoder_send_and_receive(
+		state, buffer, frame_size, frame_dts, frame_pts, frame_duration, &avrc);
+	if (rc != VOD_OK)
+	{
+		return rc;
 	}
 
 	// move to the next frame
@@ -219,10 +278,48 @@ audio_decoder_decode_frame(
 
 	state->frame_started = FALSE;
 
-	// receive a frame
-	avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
-
-	vod_memcpy(frame_end, original_pad, sizeof(original_pad));
+#if VOD_HAVE_DECODER_STATE_API
+	// Phase 28: if a state-in blob is pending and the first receive
+	// succeeded, che[][] is now allocated and we can restore the
+	// overlap. Restore, then re-send the SAME packet so the decoded
+	// frame reflects the restored IMDCT overlap. The discarded first
+	// decode wasted one IMDCT, but no real-content samples are lost
+	// because we re-decode the same source packet.
+	if (avrc == 0 &&
+	    state->state_in_data != NULL &&
+	    state->state_in_size > 0 &&
+	    !state->state_restored)
+	{
+		int set_rc = avcodec_set_decoder_state(state->decoder,
+			state->state_in_data, state->state_in_size);
+		state->state_restored = 1;
+		if (set_rc < 0)
+		{
+			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+				"audio_decoder_decode_frame: avcodec_set_decoder_state failed "
+				"%d (size=%uz) — continuing with cold-start overlap",
+				set_rc, state->state_in_size);
+		}
+		else
+		{
+			// Re-send same packet with restored overlap. Re-use the
+			// original dts/pts/duration so the encoder pipeline sees the
+			// same timestamps.
+			int redecode_avrc = 0;
+			vod_status_t redecode_rc = audio_decoder_send_and_receive(
+				state, buffer, frame_size, frame_dts, frame_pts,
+				frame_duration, &redecode_avrc);
+			if (redecode_rc != VOD_OK)
+			{
+				return redecode_rc;
+			}
+			avrc = redecode_avrc;
+			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
+				"audio_decoder_decode_frame: restored state and re-decoded "
+				"first packet (size=%uz)", state->state_in_size);
+		}
+	}
+#endif
 
 	if (avrc == AVERROR(EAGAIN))
 	{
@@ -335,4 +432,52 @@ audio_decoder_get_frame(
 			return rc;
 		}
 	}
+}
+
+// Phase 28: snapshot the decoder's cross-frame state into an FFSA blob
+// for transport to the next segment. Safe to call any time after at
+// least one frame has been decoded. Returns VOD_OK + NULL buffer if
+// the library lacks the API or the decoder hasn't allocated its
+// channel elements yet (benign — caller proceeds without a blob).
+vod_status_t
+audio_decoder_capture_state(
+	audio_decoder_state_t* state,
+	u_char** out_data,
+	size_t* out_size)
+{
+	*out_data = NULL;
+	*out_size = 0;
+
+	if (state == NULL || state->decoder == NULL)
+	{
+		return VOD_OK;
+	}
+
+#if VOD_HAVE_DECODER_STATE_API
+	{
+		uint8_t* blob = NULL;
+		size_t   blob_sz = 0;
+		int      grc;
+
+		grc = avcodec_get_decoder_state(state->decoder, &blob, &blob_sz);
+		if (grc >= 0 && blob != NULL && blob_sz > 0)
+		{
+			*out_data = blob;
+			*out_size = blob_sz;
+			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
+				"audio_decoder_capture_state: captured %uz bytes", blob_sz);
+		}
+		else
+		{
+			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
+				"audio_decoder_capture_state: avcodec_get_decoder_state=%d", grc);
+			if (blob != NULL)
+			{
+				av_free(blob);
+			}
+		}
+	}
+#endif
+
+	return VOD_OK;
 }

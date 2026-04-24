@@ -29,6 +29,7 @@
 #define VOD_FFSA_COMPONENT_AAC_ENCODER 0x0001
 #define VOD_FFSA_COMPONENT_ARESAMPLE   0x0002
 #define VOD_FFSA_COMPONENT_AMIX        0x0003
+#define VOD_FFSA_COMPONENT_AAC_DECODER 0x0004  /* Phase 28 */
 
 // Big-endian scalar reads used for walking the FFSA header at transport level.
 // Kept private to this TU so we never link libavcodec/state_format.c from here.
@@ -758,6 +759,8 @@ static vod_status_t
 audio_filter_restore_state(
 	request_context_t* request_context,
 	AVFilterGraph* graph,
+	audio_filter_source_t* sources,
+	audio_filter_source_t* sources_end,
 	const u_char* blob,
 	size_t size,
 	const u_char** out_encoder_data,
@@ -765,6 +768,7 @@ audio_filter_restore_state(
 {
 	const uint8_t* cursor;
 	size_t remaining;
+	audio_filter_source_t* src_iter = sources;
 
 	*out_encoder_data = NULL;
 	*out_encoder_size = 0;
@@ -862,6 +866,30 @@ audio_filter_restore_state(
 				"ignored (ffmpeg lacks filter-state API)", (unsigned)component_id);
 			break;
 #endif
+
+		case VOD_FFSA_COMPONENT_AAC_DECODER:
+			// Phase 28: per-source AAC decoder state. The transport
+			// carries one 0x0004 blob per source in the same enumeration
+			// order as the sources array, so we assign them round-robin.
+			// audio_decoder.c picks up the blob pointer and triggers the
+			// warm-up-and-re-decode dance on the first packet.
+			if (src_iter < sources_end)
+			{
+				src_iter->decoder.state_in_data = (const u_char*)cursor;
+				src_iter->decoder.state_in_size = blob_len;
+				src_iter->decoder.state_restored = 0;
+				vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+					"audio_filter_restore_state: queued decoder blob %uz bytes "
+					"for source", blob_len);
+				src_iter++;
+			}
+			else
+			{
+				vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+					"audio_filter_restore_state: decoder blob present (%uz bytes) "
+					"but sources exhausted, skipping", blob_len);
+			}
+			break;
 
 		default:
 			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
@@ -1004,6 +1032,101 @@ audio_filter_capture_filter_state(
 		new_size);
 }
 #endif  // VOD_HAVE_FILTER_STATE_API
+
+// Phase 28: append one FFSA_COMPONENT_AAC_DECODER blob per source, in
+// enumeration order, to the shuttle's state_out_data. Pattern mirrors
+// audio_filter_capture_filter_state. Decoder blobs go AFTER the
+// encoder + filter blobs so the reader can pick them off in order as
+// it encounters 0x0004 components.
+static void
+audio_filter_capture_decoder_states(
+	request_context_t* request_context,
+	audio_filter_source_t* sources,
+	audio_filter_source_t* sources_end,
+	u_char** state_out_data,
+	size_t* state_out_size)
+{
+	audio_filter_source_t* src;
+	size_t n_sources = (size_t)(sources_end - sources);
+	u_char** blobs;
+	size_t*  sizes;
+	size_t total_bytes = 0;
+	size_t i;
+	u_char* new_blob;
+	size_t  new_size;
+	size_t  off;
+
+	if (state_out_data == NULL || state_out_size == NULL)
+		return;
+	if (*state_out_data == NULL || *state_out_size == 0)
+		return;
+	if (n_sources == 0)
+		return;
+
+	blobs = vod_alloc(request_context->pool, sizeof(*blobs) * n_sources);
+	sizes = vod_alloc(request_context->pool, sizeof(*sizes) * n_sources);
+	if (blobs == NULL || sizes == NULL)
+	{
+		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+			"audio_filter_capture_decoder_states: vod_alloc failed, skipping");
+		return;
+	}
+
+	for (i = 0, src = sources; i < n_sources; i++, src++)
+	{
+		u_char* buf = NULL;
+		size_t  buf_size = 0;
+		vod_status_t rc = audio_decoder_capture_state(
+			&src->decoder, &buf, &buf_size);
+		blobs[i] = buf;
+		sizes[i] = buf_size;
+		if (rc == VOD_OK && buf_size > 0)
+			total_bytes += buf_size;
+	}
+
+	if (total_bytes == 0)
+	{
+		// Nothing to append — log and return without touching the
+		// existing state_out_data.
+		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+			"audio_filter_capture_decoder_states: no decoder blobs captured");
+		return;
+	}
+
+	new_size = *state_out_size + total_bytes;
+	new_blob = av_malloc(new_size);
+	if (new_blob == NULL)
+	{
+		for (i = 0; i < n_sources; i++)
+		{
+			if (blobs[i] != NULL)
+				av_free(blobs[i]);
+		}
+		vod_log_error(VOD_LOG_WARN, request_context->log, 0,
+			"audio_filter_capture_decoder_states: av_malloc(%uz) failed, "
+			"dropping decoder blobs", new_size);
+		return;
+	}
+
+	vod_memcpy(new_blob, *state_out_data, *state_out_size);
+	off = *state_out_size;
+	for (i = 0; i < n_sources; i++)
+	{
+		if (blobs[i] == NULL)
+			continue;
+		vod_memcpy(new_blob + off, blobs[i], sizes[i]);
+		off += sizes[i];
+		av_free(blobs[i]);
+	}
+
+	av_free(*state_out_data);
+	*state_out_data = new_blob;
+	*state_out_size = new_size;
+
+	vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+		"audio_filter_capture_decoder_states: appended decoder blobs "
+		"(new total %uz bytes)", new_size);
+}
 
 vod_status_t
 audio_filter_alloc_state(
@@ -1236,6 +1359,8 @@ audio_filter_alloc_state(
 			rc = audio_filter_restore_state(
 				request_context,
 				state->filter_graph,
+				state->sources,
+				state->sources_end,
 				request_context->audio_encoder_state_shuttle->state_in_data,
 				request_context->audio_encoder_state_shuttle->state_in_size,
 				&encoder_slice_data,
@@ -1638,6 +1763,16 @@ audio_filter_process(void* context)
 					audio_filter_capture_filter_state(
 						state->request_context,
 						state->filter_graph,
+						state->request_context->audio_encoder_state_shuttle->state_out_data,
+						state->request_context->audio_encoder_state_shuttle->state_out_size);
+
+					// Phase 28: append per-source AAC decoder blobs. Runs
+					// after filter capture so the final blob order is
+					// [encoder][aresample][amix][decoder[0]..decoder[N-1]].
+					audio_filter_capture_decoder_states(
+						state->request_context,
+						state->sources,
+						state->sources_end,
 						state->request_context->audio_encoder_state_shuttle->state_out_data,
 						state->request_context->audio_encoder_state_shuttle->state_out_size);
 				}

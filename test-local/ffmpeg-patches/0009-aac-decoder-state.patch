@@ -59,7 +59,7 @@ diff --git a/libavcodec/aac/aacdec_state.c b/libavcodec/aac/aacdec_state.c
 new file mode 100644
 --- /dev/null
 +++ b/libavcodec/aac/aacdec_state.c
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,315 @@
 +/*
 + * AAC decoder — state snapshot/restore (Phase 28).
 + *
@@ -379,7 +379,7 @@ diff --git a/libavcodec/aac/aacdec_state.h b/libavcodec/aac/aacdec_state.h
 new file mode 100644
 --- /dev/null
 +++ b/libavcodec/aac/aacdec_state.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,27 @@
 +/*
 + * AAC decoder state snapshot/restore — internal declarations (Phase 28).
 + *
