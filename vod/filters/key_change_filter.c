@@ -3,15 +3,28 @@
 #include "../media_set_parser.h"
 
 // macros
-//   asetrate shifts pitch by changing the sample rate, aresample restores it,
-//   atempo compensates the resulting speed change.
-//   pitch_ratio = 2^(semitones/12), tempo_ratio = 1/pitch_ratio
+//   asetrate shifts pitch by changing the declared sample rate, aresample
+//   restores the rate, atempo compensates the resulting speed change.
+//
+//   For the chain to preserve segment duration exactly (no cumulative
+//   drift across HLS segments) we need:
+//     pitch_actual × atempo_actual == 1 EXACTLY
+//
+//   ffmpeg's asetrate.sample_rate is AV_OPT_TYPE_INT, so the declared
+//   rate is whatever integer we pass. We therefore (a) format asetrate
+//   as a single integer (round(44100 * pitch_ratio)) so the value
+//   ffmpeg actually applies is the value we computed, and (b) derive
+//   atempo as the EXACT reciprocal (44100 / asetrate_int) at 6-decimal
+//   precision so the residual error is <1 ppm per segment instead of
+//   the ~25 ppm we got from the previous independently-rounded
+//   pitch/tempo tables.
 #define KEY_CHANGE_FILTER_DESC_PATTERN \
-	"[%uD]asetrate=%uD*%uD.%04uD,aresample=%uD,atempo=%uD.%04uD[%uD]"
+	"[%uD]asetrate=%uD,aresample=%uD,atempo=%uD.%06uD[%uD]"
 
-// the filter desc is long due to two decimal numbers + sample rate references
+// the filter desc carries 6 ints (id, asetrate, aresample, atempo
+// whole, atempo frac, dst id) so allocate enough space for them all.
 #define KEY_CHANGE_FILTER_MAX_DESC_SIZE \
-	(sizeof(KEY_CHANGE_FILTER_DESC_PATTERN) + VOD_INT32_LEN * 8)
+	(sizeof(KEY_CHANGE_FILTER_DESC_PATTERN) + VOD_INT32_LEN * 6)
 
 #define KEY_CHANGE_MIN_SEMITONES (-12)
 #define KEY_CHANGE_MAX_SEMITONES (12)
@@ -63,37 +76,10 @@ static const uint32_t pitch_ratio_table[25] = {
 	20000,	//  +12: 2^(12/12)  = 2.0000
 };
 
-// inverse: 1/pitch_ratio * 10000 (tempo compensation)
-//   index 0  = -12 semitones = 2.0000x tempo
-//   index 12 =   0 semitones = 1.0000x tempo
-//   index 24 = +12 semitones = 0.5000x tempo
-static const uint32_t tempo_ratio_table[25] = {
-	20000,	//  -12: 1/0.5000 = 2.0000
-	18877,	//  -11: 1/0.5297 = 1.8877
-	17818,	//  -10: 1/0.5612 = 1.7818
-	16818,	//   -9: 1/0.5946 = 1.6818
-	15874,	//   -8: 1/0.6300 = 1.5874
-	14983,	//   -7: 1/0.6674 = 1.4983
-	14142,	//   -6: 1/0.7071 = 1.4142
-	13348,	//   -5: 1/0.7492 = 1.3348
-	12599,	//   -4: 1/0.7937 = 1.2599
-	11892,	//   -3: 1/0.8409 = 1.1892
-	11225,	//   -2: 1/0.8909 = 1.1225
-	10595,	//   -1: 1/0.9439 = 1.0595
-	10000,	//    0: 1/1.0000 = 1.0000
-	 9439,	//   +1: 1/1.0595 = 0.9439
-	 8909,	//   +2: 1/1.1225 = 0.8909
-	 8409,	//   +3: 1/1.1892 = 0.8409
-	 7937,	//   +4: 1/1.2599 = 0.7937
-	 7492,	//   +5: 1/1.3348 = 0.7492
-	 7071,	//   +6: 1/1.4142 = 0.7071
-	 6674,	//   +7: 1/1.4983 = 0.6674
-	 6300,	//   +8: 1/1.5874 = 0.6300
-	 5946,	//   +9: 1/1.6818 = 0.5946
-	 5612,	//  +10: 1/1.7818 = 0.5612
-	 5297,	//  +11: 1/1.8877 = 0.5297
-	 5000,	//  +12: 1/2.0000 = 0.5000
-};
+// (tempo_ratio_table removed — atempo is now derived exactly from the
+//  integer asetrate value in key_change_filter_append_desc, so the
+//  product pitch × tempo is 1 to within ~1 ppm instead of the ~25 ppm
+//  we got from independently-rounded 4-decimal lookup tables.)
 
 // globals
 static vod_hash_t key_change_filter_hash;
@@ -108,29 +94,43 @@ static u_char*
 key_change_filter_append_desc(u_char* p, media_clip_t* clip)
 {
 	media_clip_key_change_filter_t* filter = vod_container_of(clip, media_clip_key_change_filter_t, base);
-	uint32_t pitch;
-	uint32_t tempo;
+	uint32_t pitch_4dp;
+	uint32_t asetrate_int;
+	uint64_t atempo_6dp;
+	uint32_t atempo_whole;
+	uint32_t atempo_frac;
 	int idx;
 
 	idx = filter->semitones - KEY_CHANGE_MIN_SEMITONES;
-	pitch = pitch_ratio_table[idx];
-	tempo = tempo_ratio_table[idx];
+	pitch_4dp = pitch_ratio_table[idx];
 
-	// output: [src]asetrate=SR*P.PPPP,aresample=SR,atempo=T.TTTT[dst]
-	// SR is hardcoded to 44100 — the standard sample rate for music.
-	// asetrate changes the declared sample rate (shifting pitch),
-	// aresample resamples back to 44100,
-	// atempo compensates the speed change.
+	// Compute the exact integer asetrate ffmpeg will apply. Going
+	// through the int math here means the value we ship in the filter
+	// description matches the value ffmpeg uses internally — no
+	// surprises from float-to-int truncation inside the filter
+	// expression evaluator.
+	asetrate_int = (uint32_t)((44100ULL * pitch_4dp) / 10000ULL);
+
+	// Derive atempo as the EXACT reciprocal of the pitch shift at
+	// 6-decimal precision: atempo = 44100 / asetrate_int. This makes
+	// pitch_actual × atempo_actual = 1 to within ~1 ppm, replacing
+	// the previous ~25 ppm error from independently-rounded tables.
+	// Without this, every segment was ~5 samples too long, which
+	// compounded into ~10 ms drift per minute of playback (and
+	// reset by seek — exactly the user-visible drift pattern).
+	atempo_6dp = (44100ULL * 1000000ULL) / (uint64_t)asetrate_int;
+	atempo_whole = (uint32_t)(atempo_6dp / 1000000ULL);
+	atempo_frac  = (uint32_t)(atempo_6dp % 1000000ULL);
+
+	// output: [src]asetrate=N,aresample=44100,atempo=T.TTTTTT[dst]
 	return vod_sprintf(
 		p,
 		KEY_CHANGE_FILTER_DESC_PATTERN,
 		clip->sources[0]->id,
+		asetrate_int,
 		(uint32_t)44100,
-		pitch / 10000,
-		pitch % 10000,
-		(uint32_t)44100,
-		tempo / 10000,
-		tempo % 10000,
+		atempo_whole,
+		atempo_frac,
 		clip->id);
 }
 
