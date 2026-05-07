@@ -8,7 +8,15 @@
 #endif // NGX_HAVE_OPENSSL_EVP
 
 // macros
-#define M3U8_HEADER_PART1 "#EXTM3U\n#EXT-X-TARGETDURATION:%uL\n#EXT-X-ALLOW-CACHE:YES\n"
+// EXT-X-ALLOW-CACHE was deprecated in HLS spec v7+ but old / constrained
+// clients (older Roku, smart-speaker / TV-OS players, Alexa multimodal,
+// etc.) still honor it as "you may persist these segments to disk
+// between sessions" — independent of HTTP Cache-Control. For our
+// stateful-audio pipeline that's wrong: every segment fetch must hit
+// the origin so the latest server-side mix (mute, gain, key shift)
+// is reflected. Hardcoding NO is conservative and only affects clients
+// that still read this tag; modern players ignore it either way.
+#define M3U8_HEADER_PART1 "#EXTM3U\n#EXT-X-TARGETDURATION:%uL\n#EXT-X-ALLOW-CACHE:NO\n"
 #define M3U8_HEADER_VOD "#EXT-X-PLAYLIST-TYPE:VOD\n"
 #define M3U8_HEADER_EVENT "#EXT-X-PLAYLIST-TYPE:EVENT\n"
 #define M3U8_HEADER_PART2 "#EXT-X-VERSION:%d\n#EXT-X-MEDIA-SEQUENCE:%uD\n"
