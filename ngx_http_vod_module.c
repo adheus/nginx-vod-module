@@ -3837,15 +3837,7 @@ ngx_http_vod_encoder_state_get_finished(
 {
 	ngx_http_vod_ctx_t* ctx = context;
 
-	if (rc == NGX_HTTP_NOT_FOUND)
-	{
-		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->submodule_context.r->connection->log, 0,
-			"ngx_http_vod_encoder_state_get_finished: 404 for key=%V (fresh encoder)",
-			&ctx->audio_state_key);
-		ctx->audio_state_shuttle.state_in_data = NULL;
-		ctx->audio_state_shuttle.state_in_size = 0;
-	}
-	else if (rc == NGX_OK && buf != NULL && bytes_read > 0)
+	if (rc == NGX_OK && buf != NULL && bytes_read > 0)
 	{
 		ctx->audio_state_shuttle.state_in_data = buf->pos;
 		ctx->audio_state_shuttle.state_in_size = (size_t)bytes_read;
@@ -3853,11 +3845,32 @@ ngx_http_vod_encoder_state_get_finished(
 			"ngx_http_vod_encoder_state_get_finished: got %z bytes for key=%V",
 			bytes_read, &ctx->audio_state_key);
 	}
+	else if (rc == NGX_HTTP_NOT_FOUND || (rc == NGX_OK && bytes_read == 0))
+	{
+		// Clean "no blob stored under this key". The upstream signals this as
+		// 200-with-empty-body rather than 404, because ngx_child_request maps
+		// every non-2xx to 502 and we would not be able to tell a cache miss
+		// apart from a genuinely broken upstream. (NGX_HTTP_NOT_FOUND is kept
+		// here in case a future transport propagates the status directly.)
+		//
+		// Segment 0 never reaches this callback — ngx_http_vod_encoder_state_get
+		// short-circuits it. So a miss HERE means the predecessor's blob was
+		// never stored, or was stored under a different key: the FFSA chain is
+		// broken mid-stream and this segment boundary will tick. That is worth
+		// a warning, and it is now the ONLY thing this warning means.
+		ngx_log_error(NGX_LOG_WARN, ctx->submodule_context.r->connection->log, 0,
+			"ngx_http_vod_encoder_state_get_finished: no prior state for key=%V "
+			"(segment %uD) - FFSA chain break, encoder starts cold",
+			&ctx->audio_state_key,
+			ctx->submodule_context.request_params.segment_index);
+		ctx->audio_state_shuttle.state_in_data = NULL;
+		ctx->audio_state_shuttle.state_in_size = 0;
+	}
 	else
 	{
 		ngx_log_error(NGX_LOG_WARN, ctx->submodule_context.r->connection->log, 0,
-			"ngx_http_vod_encoder_state_get_finished: upstream error %i, "
-			"falling back to fresh encoder", rc);
+			"ngx_http_vod_encoder_state_get_finished: upstream error %i for key=%V, "
+			"falling back to fresh encoder", rc, &ctx->audio_state_key);
 		ctx->audio_state_shuttle.state_in_data = NULL;
 		ctx->audio_state_shuttle.state_in_size = 0;
 	}
@@ -3896,6 +3909,36 @@ ngx_http_vod_encoder_state_get(ngx_http_vod_ctx_t* ctx)
 	}
 	if (!ctx->submodule_context.media_set.audio_filtering_needed)
 	{
+		return NGX_OK;
+	}
+
+	// Segment 0 has no predecessor, so there is nothing to restore. We used
+	// to issue the GET anyway with state_end_seg_index wrapped to UINT32_MAX
+	// and rely on the upstream 404 to fall through to a fresh encoder. That
+	// worked, but it cost a pointless round trip on every session start and —
+	// because ngx_child_request collapses every non-2xx to 502
+	// (ngx_child_http_request.c, the `default:` arm of the status switch) —
+	// logged an alarming "upstream error 502" for a completely normal
+	// cold start. In production that noise accounted for the large majority
+	// of FFSA state-GET failures and masked the genuine mid-stream chain
+	// breaks, which are the ones worth looking at.
+	//
+	// Skip it. A fresh encoder IS the correct behaviour for the first segment,
+	// so not asking is equivalent to asking and being told "no".
+	//
+	// Unless the upstream can actually synthesise something for the cold start:
+	// vod_encoder_state_cold_start_get on keeps the old behaviour for upstreams
+	// that answer the UINT32_MAX key with a "silent-warmed" encoder state, so
+	// segment 0 fades in instead of emitting ~46 ms of AAC priming zeros (see
+	// test-local/state_server.py). Default is off.
+	if (ctx->submodule_context.request_params.segment_index == 0 &&
+		!conf->encoder_state_cold_start_get)
+	{
+		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+			"ngx_http_vod_encoder_state_get: segment 0 has no prior state, "
+			"skipping GET (fresh encoder)");
+		ctx->audio_state_shuttle.state_in_data = NULL;
+		ctx->audio_state_shuttle.state_in_size = 0;
 		return NGX_OK;
 	}
 
