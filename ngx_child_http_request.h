@@ -7,6 +7,26 @@
 // typedefs
 typedef void(*ngx_child_request_callback_t)(void* context, ngx_int_t rc, ngx_buf_t* buf, ssize_t bytes_read);
 
+// batch-scoped hub, shared by all outstanding child requests of one parent
+// request. while any completed child awaits delivery, the parent's
+// write_event_handler and module context are hijacked once (not per child);
+// ngx_child_request_wev_handler restores them and drains the completed queue.
+typedef struct {
+	// the parent request all children of this hub belong to
+	ngx_http_request_t* r;
+
+	// children that completed and await draining by the parent's write event handler
+	ngx_queue_t completed;
+
+	// number of children issued and not yet completed
+	ngx_uint_t pending;
+
+	// parent state saved while the parent is hijacked
+	ngx_http_event_handler_pt original_write_event_handler;
+	void* original_context;
+	unsigned hijacked:1;
+} ngx_child_request_hub_t;
+
 typedef struct {
 	ngx_uint_t method;
 	ngx_str_t base_uri;
@@ -35,8 +55,12 @@ typedef struct {
 //	2. response_buffer is optional, if it is not supplied, the upstream response gets written
 //		to the parent request. when a response buffer is supplied, the response is written to it, 
 //		the buffer should be large enough to contain both the response body and the response headers.
+//	3. hub points to the caller's per-request hub slot; the hub is lazily allocated
+//		from the parent request pool on first use. all child requests of one parent
+//		request must share the same hub slot.
 ngx_int_t ngx_child_request_start(
 	ngx_http_request_t *r,
+	ngx_child_request_hub_t** hub,
 	ngx_child_request_callback_t callback,
 	void* callback_context,
 	ngx_str_t* internal_location,

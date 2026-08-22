@@ -27,11 +27,13 @@ typedef struct {
 #endif
 	ngx_list_t upstream_headers;
 
+	// hub linkage
+	ngx_child_request_hub_t* hub;
+	ngx_queue_t queue;
+
 	// temporary completion state
 	ngx_http_request_t* sr;
 	ngx_int_t error_code;
-	ngx_http_event_handler_pt original_write_event_handler;
-	void *original_context;
 
 	// misc
 	ngx_flag_t dont_send_header;
@@ -105,24 +107,19 @@ static ngx_child_request_hide_header_t hide_headers[] = {
 static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 static ngx_hash_t hide_headers_hash;
 
+// evaluate the result of a single completed child request and deliver it -
+// either by invoking the caller's callback or, for callback-less (dump)
+// children, by finalizing the parent request
 static void
-ngx_child_request_wev_handler(ngx_http_request_t *r)
+ngx_child_request_process_completed(
+	ngx_http_request_t *r,
+	ngx_child_request_context_t* ctx)
 {
-	ngx_child_request_context_t* ctx;
 	ngx_http_upstream_t *u;
 	ngx_http_request_t* sr;
 	ngx_buf_t* b;
 	ngx_int_t rc;
 	off_t content_length;
-
-	ctx = ngx_http_get_module_ctx(r, ngx_http_vod_module);
-
-	// restore the write event handler
-	r->write_event_handler = ctx->original_write_event_handler;
-	ctx->original_write_event_handler = NULL;
-
-	// restore the original context
-	ngx_http_set_ctx(r, ctx->original_context, ngx_http_vod_module);
 
 	// get the completed upstream
 	sr = ctx->sr;
@@ -131,7 +128,7 @@ ngx_child_request_wev_handler(ngx_http_request_t *r)
 	if (sr == NULL)
 	{
 		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-			"ngx_child_request_wev_handler: unexpected, subrequest is null");
+			"ngx_child_request_process_completed: unexpected, subrequest is null");
 		return;
 	}
 
@@ -143,7 +140,7 @@ ngx_child_request_wev_handler(ngx_http_request_t *r)
 		if (sr->out == NULL || sr->out->buf == NULL)
 		{
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-				"ngx_child_request_wev_handler: unexpected, output buffer is null");
+				"ngx_child_request_process_completed: unexpected, output buffer is null");
 			return;
 		}
 
@@ -157,30 +154,12 @@ ngx_child_request_wev_handler(ngx_http_request_t *r)
 	if (u == NULL)
 	{
 		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-			"ngx_child_request_wev_handler: unexpected, upstream is null");
+			"ngx_child_request_process_completed: unexpected, upstream is null");
 		return;
 	}
 
 	b = &u->buffer;
 #endif
-
-	// code taken from echo-nginx-module to work around nginx subrequest issues
-	if (r == r->connection->data && r->postponed) {
-
-		if (r->postponed->request) {
-			r->connection->data = r->postponed->request;
-
-#if defined(nginx_version) && nginx_version >= 8012
-			ngx_http_post_request(r->postponed->request, NULL);
-#else
-			ngx_http_post_request(r->postponed->request);
-#endif
-
-		}
-		else {
-			ngx_http_output_filter(r, NULL);
-		}
-	}
 
 	// get the final error code
 	rc = ctx->error_code;
@@ -193,7 +172,7 @@ ngx_child_request_wev_handler(ngx_http_request_t *r)
 			if (u->headers_in.content_length_n > 0 && u->headers_in.content_length_n != b->last - b->pos)
 			{
 				ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-					"ngx_child_request_wev_handler: upstream connection was closed with %O bytes left to read", 
+					"ngx_child_request_process_completed: upstream connection was closed with %O bytes left to read", 
 					u->headers_in.content_length_n - (b->last - b->pos));
 				rc = NGX_HTTP_BAD_GATEWAY;
 			}
@@ -209,12 +188,12 @@ ngx_child_request_wev_handler(ngx_http_request_t *r)
 			if (u->headers_in.status_n != 0)
 			{
 				ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-					"ngx_child_request_wev_handler: upstream returned a bad status %ui", u->headers_in.status_n);
+					"ngx_child_request_process_completed: upstream returned a bad status %ui", u->headers_in.status_n);
 			}
 			else
 			{
 				ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-					"ngx_child_request_wev_handler: failed to get upstream status");
+					"ngx_child_request_process_completed: failed to get upstream status");
 			}
 			rc = NGX_HTTP_BAD_GATEWAY;
 			break;
@@ -223,7 +202,7 @@ ngx_child_request_wev_handler(ngx_http_request_t *r)
 	else if (rc == NGX_ERROR)
 	{
 		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-			"ngx_child_request_wev_handler: got error -1, changing to 502");
+			"ngx_child_request_process_completed: got error -1, changing to 502");
 		rc = NGX_HTTP_BAD_GATEWAY;
 	}
 
@@ -267,6 +246,66 @@ ngx_child_request_wev_handler(ngx_http_request_t *r)
 	}
 }
 
+static void
+ngx_child_request_wev_handler(ngx_http_request_t *r)
+{
+	ngx_child_request_context_t* ctx;
+	ngx_child_request_hub_t* hub;
+	ngx_connection_t* c;
+	ngx_queue_t* q;
+	ngx_flag_t last;
+
+	hub = ngx_http_get_module_ctx(r, ngx_http_vod_module);
+
+	// restore the write event handler
+	r->write_event_handler = hub->original_write_event_handler;
+	hub->original_write_event_handler = NULL;
+
+	// restore the original context
+	ngx_http_set_ctx(r, hub->original_context, ngx_http_vod_module);
+	hub->original_context = NULL;
+	hub->hijacked = 0;
+
+	// code taken from echo-nginx-module to work around nginx subrequest issues
+	if (r == r->connection->data && r->postponed) {
+
+		if (r->postponed->request) {
+			r->connection->data = r->postponed->request;
+
+#if defined(nginx_version) && nginx_version >= 8012
+			ngx_http_post_request(r->postponed->request, NULL);
+#else
+			ngx_http_post_request(r->postponed->request);
+#endif
+
+		}
+		else {
+			ngx_http_output_filter(r, NULL);
+		}
+	}
+
+	// drain the completed children - a callback may finalize the parent
+	// request (which frees the pool holding the hub), so never touch the
+	// hub again after processing the last queued child
+	c = r->connection;
+
+	while (!ngx_queue_empty(&hub->completed))
+	{
+		q = ngx_queue_head(&hub->completed);
+		ngx_queue_remove(q);
+		ctx = ngx_queue_data(q, ngx_child_request_context_t, queue);
+
+		last = ngx_queue_empty(&hub->completed) ? 1 : 0;
+
+		ngx_child_request_process_completed(r, ctx);
+
+		if (last || c->destroyed)
+		{
+			return;
+		}
+	}
+}
+
 static ngx_int_t
 ngx_child_request_finished_handler(
 	ngx_http_request_t *r, 
@@ -275,6 +314,7 @@ ngx_child_request_finished_handler(
 {
 	ngx_http_request_t          *pr;
 	ngx_child_request_context_t* ctx;
+	ngx_child_request_hub_t* hub;
 
 	ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 		"ngx_child_request_finished_handler: error code %i", rc);
@@ -294,23 +334,28 @@ ngx_child_request_finished_handler(
 	ctx->sr = r;
 	ctx->error_code = rc;
 
-	if (ctx->original_write_event_handler != NULL)
-	{
-		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-			"ngx_child_request_finished_handler: "
-			"unexpected original_write_event_handler not null");
-		return NGX_ERROR;
-	}
+	// queue the completed child on its hub, to be drained by the parent's
+	// write event handler
+	hub = ctx->hub;
+	ngx_queue_insert_tail(&hub->completed, &ctx->queue);
+	hub->pending--;
 
-	// replace the parent write event handler
 	pr = r->parent;
 
-	ctx->original_write_event_handler = pr->write_event_handler;
-	pr->write_event_handler = ngx_child_request_wev_handler;
+	// hijack the parent request once per batch - restored by
+	// ngx_child_request_wev_handler before it invokes any callback
+	if (!hub->hijacked)
+	{
+		hub->hijacked = 1;
 
-	// temporarily replace the parent context
-	ctx->original_context = ngx_http_get_module_ctx(pr, ngx_http_vod_module);
-	ngx_http_set_ctx(pr, ctx, ngx_http_vod_module);
+		// replace the parent write event handler
+		hub->original_write_event_handler = pr->write_event_handler;
+		pr->write_event_handler = ngx_child_request_wev_handler;
+
+		// temporarily replace the parent context
+		hub->original_context = ngx_http_get_module_ctx(pr, ngx_http_vod_module);
+		ngx_http_set_ctx(pr, hub, ngx_http_vod_module);
+	}
 
 	// work-around issues in nginx's event module (from echo-nginx-module)
 	if (r != r->connection->data
@@ -653,6 +698,7 @@ ngx_child_request_copy_headers(
 ngx_int_t
 ngx_child_request_start(
 	ngx_http_request_t *r,
+	ngx_child_request_hub_t** hub,
 	ngx_child_request_callback_t callback,
 	void* callback_context,
 	ngx_str_t* internal_location,
@@ -667,6 +713,21 @@ ngx_child_request_start(
 	ngx_int_t rc;
 	u_char* p;
 
+	// lazily create the hub shared by all children of this parent request
+	if (*hub == NULL)
+	{
+		*hub = ngx_pcalloc(r->pool, sizeof(ngx_child_request_hub_t));
+		if (*hub == NULL)
+		{
+			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+				"ngx_child_request_start: ngx_pcalloc failed (hub)");
+			return NGX_ERROR;
+		}
+
+		(*hub)->r = r;
+		ngx_queue_init(&(*hub)->completed);
+	}
+
 	// create the child context
 	child_ctx = ngx_pcalloc(r->pool, sizeof(*child_ctx));
 	if (child_ctx == NULL)
@@ -676,6 +737,7 @@ ngx_child_request_start(
 		return NGX_ERROR;
 	}
 
+	child_ctx->hub = *hub;
 	child_ctx->callback = callback;
 	child_ctx->callback_context = callback_context;
 	child_ctx->response_buffer = response_buffer;
@@ -744,6 +806,8 @@ ngx_child_request_start(
 			"ngx_child_request_start: ngx_http_subrequest failed %i", rc);
 		return rc;
 	}
+
+	(*hub)->pending++;
 
 	// set the context of the subrequest
 	ngx_http_set_ctx(sr, child_ctx, ngx_http_vod_module);

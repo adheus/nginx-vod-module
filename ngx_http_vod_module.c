@@ -164,6 +164,9 @@ struct ngx_http_vod_ctx_s {
 	u_char child_request_key[BUFFER_CACHE_KEY_SIZE];
 	ngx_http_vod_state_machine_t state_machine;
 
+	// child requests (hub shared by all children of this request)
+	ngx_child_request_hub_t* child_hub;
+
 	// iterators
 	media_sequence_t* cur_sequence;
 	media_clip_source_t* cur_source;
@@ -1466,6 +1469,7 @@ ngx_http_vod_state_machine_get_drm_info(ngx_http_vod_ctx_t *ctx)
 
 		rc = ngx_child_request_start(
 			r,
+			&ctx->child_hub,
 			ngx_http_vod_drm_info_request_finished,
 			r,
 			&conf->drm_upstream_location,
@@ -4159,6 +4163,7 @@ ngx_http_vod_encoder_state_get(ngx_http_vod_ctx_t* ctx)
 
 	rc = ngx_child_request_start(
 		r,
+		&ctx->child_hub,
 		ngx_http_vod_encoder_state_get_finished,
 		ctx,
 		&conf->encoder_state_location,
@@ -4279,6 +4284,7 @@ ngx_http_vod_encoder_state_post(ngx_http_vod_ctx_t* ctx)
 
 	rc = ngx_child_request_start(
 		r,
+		&ctx->child_hub,
 		conf->encoder_state_post_blocking
 			? ngx_http_vod_encoder_state_post_finished
 			: NULL,
@@ -4907,7 +4913,16 @@ static ngx_int_t
 ngx_http_vod_dump_request_to_fallback(ngx_http_request_t *r)
 {
 	ngx_http_vod_loc_conf_t* conf;
+	ngx_http_vod_ctx_t *ctx;
 	ngx_child_request_params_t child_params;
+
+	ctx = ngx_http_get_module_ctx(r, ngx_http_vod_module);
+	if (ctx == NULL)
+	{
+		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+			"ngx_http_vod_dump_request_to_fallback: unexpected, context is null");
+		return NGX_ERROR;
+	}
 
 	conf = ngx_http_get_module_loc_conf(r, ngx_http_vod_module);
 
@@ -4936,6 +4951,7 @@ ngx_http_vod_dump_request_to_fallback(ngx_http_request_t *r)
 
 	return ngx_child_request_start(
 		r,
+		&ctx->child_hub,
 		NULL,
 		NULL,
 		&conf->fallback_upstream_location,
@@ -5165,6 +5181,7 @@ ngx_http_vod_async_http_read(ngx_http_vod_http_reader_state_t *state, ngx_buf_t 
 
 	return ngx_child_request_start(
 		state->r,
+		&ctx->child_hub,
 		ngx_http_vod_handle_read_completed,
 		ctx,
 		&state->upstream_location,
@@ -5191,6 +5208,7 @@ ngx_http_vod_dump_http_part(void* context, off_t start, off_t end)
 
 	return ngx_child_request_start(
 		r,
+		&ctx->child_hub,
 		ngx_http_vod_handle_read_completed,
 		ctx,
 		&state->upstream_location,
@@ -5217,6 +5235,7 @@ ngx_http_vod_dump_http_request(void* context)
 
 	return ngx_child_request_start(
 		r,
+		&ctx->child_hub,
 		NULL,
 		NULL,
 		&state->upstream_location,
@@ -5712,6 +5731,7 @@ ngx_http_vod_send_notification(ngx_http_vod_ctx_t *ctx)
 
 	return ngx_child_request_start(
 		ctx->submodule_context.r,
+		&ctx->child_hub,
 		ngx_http_vod_notification_finished,
 		ctx,
 		&conf->upstream_location,
