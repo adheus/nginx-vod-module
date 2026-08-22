@@ -10,6 +10,7 @@ read_cache_init(read_cache_state_t* state, request_context_t* request_context, s
 	state->buffer_size = buffer_size;
 	state->buffer_count = 0;
 	state->reuse_buffers = TRUE;
+	state->target_buffer = NULL;
 }
 
 vod_status_t
@@ -57,6 +58,7 @@ read_cache_get_from_cache(
 	cache_buffer_t* target_buffer;
 	cache_buffer_t* cur_buffer;
 	uint32_t read_size;
+	uint64_t cur_end_offset;
 	uint64_t aligned_last_offset;
 	uint64_t offset = request->cur_offset;
 	size_t alignment;
@@ -65,12 +67,32 @@ read_cache_get_from_cache(
 	// check whether we already have the requested offset
 	for (cur_buffer = state->buffers; cur_buffer < state->buffers_end; cur_buffer++)
 	{
-		if (cur_buffer->source == source && 
+		if (cur_buffer->in_flight)
+		{
+			// end_offset is stale until the read completes
+			continue;
+		}
+
+		if (cur_buffer->source == source &&
 			offset >= cur_buffer->start_offset && offset < cur_buffer->end_offset)
 		{
 			*buffer = cur_buffer->buffer_pos + (offset - cur_buffer->start_offset);
 			*size = cur_buffer->end_offset - offset;
 			return TRUE;
+		}
+	}
+
+	// check whether the requested offset is already being read
+	for (cur_buffer = state->buffers; cur_buffer < state->buffers_end; cur_buffer++)
+	{
+		if (cur_buffer->in_flight &&
+			cur_buffer->source == source &&
+			offset >= cur_buffer->start_offset &&
+			offset < cur_buffer->start_offset + cur_buffer->buffer_size)
+		{
+			// miss, but nothing to issue - the caller has to wait for the read to complete
+			state->target_buffer = NULL;
+			return FALSE;
 		}
 	}
 
@@ -97,6 +119,13 @@ read_cache_get_from_cache(
 	read_size = state->buffer_size;
 	target_buffer = &state->buffers[cache_slot_id % state->buffer_count];
 
+	if (target_buffer->in_flight)
+	{
+		// the slot is busy with another read - the caller has to wait for it to complete
+		state->target_buffer = NULL;
+		return FALSE;
+	}
+
 	// don't read anything that is already in the cache
 	for (cur_buffer = state->buffers; cur_buffer < state->buffers_end; cur_buffer++)
 	{
@@ -106,13 +135,18 @@ read_cache_get_from_cache(
 			continue;
 		}
 
+		// for in-flight buffers end_offset is stale - use the intended read extent
+		cur_end_offset = cur_buffer->in_flight ?
+			cur_buffer->start_offset + cur_buffer->buffer_size :
+			cur_buffer->end_offset;
+
 		if (cur_buffer->start_offset > offset)
 		{
 			read_size = vod_min(read_size, cur_buffer->start_offset - offset);
 		}
-		else if (cur_buffer->end_offset > offset)
+		else if (cur_end_offset > offset)
 		{
-			offset = cur_buffer->end_offset & ~alignment;
+			offset = cur_end_offset & ~alignment;
 		}
 	}
 
@@ -146,25 +180,27 @@ read_cache_get_read_buffer(
 	read_cache_get_read_buffer_t* result)
 {
 	cache_buffer_t* target_buffer = state->target_buffer;
-		
+
 	// return the target buffer pointer and size
 	result->source = target_buffer->source;
 	result->offset = target_buffer->start_offset;
 	result->buffer = state->reuse_buffers ? target_buffer->buffer_start : NULL;
 	result->size = target_buffer->buffer_size;
+
+	// the read is being issued - mark the slot busy and consume the demand
+	target_buffer->in_flight = TRUE;
+	state->target_buffer = NULL;
 }
 
-void 
-read_cache_read_completed(read_cache_state_t* state, vod_buf_t* buf)
+void
+read_cache_read_completed_ex(read_cache_state_t* state, cache_buffer_t* target, vod_buf_t* buf)
 {
-	cache_buffer_t* target_buffer = state->target_buffer;
-
 	// update the buffer size
-	target_buffer->buffer_start = buf->start;
-	target_buffer->buffer_pos = buf->pos;
-	target_buffer->buffer_size = buf->last - buf->pos;
-	target_buffer->end_offset = target_buffer->start_offset + target_buffer->buffer_size;
+	target->buffer_start = buf->start;
+	target->buffer_pos = buf->pos;
+	target->buffer_size = buf->last - buf->pos;
+	target->end_offset = target->start_offset + target->buffer_size;
 
-	// no longer have an active request
-	state->target_buffer = NULL;
+	// the read for this slot has landed
+	target->in_flight = FALSE;
 }
