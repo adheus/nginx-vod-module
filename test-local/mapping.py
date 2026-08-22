@@ -29,6 +29,17 @@ STEMS_DIR = f"{MEDIA_DIR}/stems"
 def stem(name):
     return {"type": "source", "path": f"{STEMS_DIR}/{name}.m4a"}
 
+# --- remote mode -------------------------------------------------------
+# In remote mode the module builds the subrequest URI as
+#   vod_remote_upstream_location + path
+# (ngx_child_http_request.c:699-707), so `path` must NOT repeat the
+# location prefix. /origin_proxy/ strips itself before hitting
+# origin_server.py, which serves these straight out of /web/content.
+def rstem(name):
+    return {"type": "source", "path": f"/stems/{name}.m4a"}
+
+ALL_STEMS = ["vocals", "bass", "drums", "guitars", "piano", "other"]
+
 def with_gain(gain, source):
     return {"type": "gainFilter", "gain": gain, "source": source}
 
@@ -195,6 +206,13 @@ MAPPINGS = {
 
     # Vocals only
     "song_vocals": seq(stem("vocals")),
+
+    # ---- remote-mode twins (HTTP reader; see origin_server.py) --------
+    # r_song_full is THE benchmark fixture: 6 sources => 6 serial reads
+    # today, ~1 wave once reads go concurrent.
+    "r_song_full": seq(mix(*[rstem(n) for n in ALL_STEMS])),
+    "r_song_vocals": seq(rstem("vocals")),
+    "r_song_key_up_2": seq(with_key(2, mix(*[rstem(n) for n in ALL_STEMS]))),
 
     # Instrumental — all stems except vocals
     "song_no_vocals": seq(mix(

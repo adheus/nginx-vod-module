@@ -187,6 +187,7 @@ COPY test-local/nginx.conf /usr/local/nginx/conf/nginx.conf
 COPY test-local/media/ /web/content/
 COPY test-local/mapping.py /web/mapping.py
 COPY test-local/state_server.py /web/state_server.py
+COPY test-local/origin_server.py /web/origin_server.py
 COPY test-local/test_player.html /web/test/test_player.html
 RUN mkdir -p /tmp/state-blobs
 
@@ -194,4 +195,4 @@ EXPOSE 8080
 
 # Start both the mapping server (port 8888) and the state-upstream server
 # (port 8889) alongside nginx.
-CMD python3 /web/mapping.py & python3 /web/state_server.py & /usr/local/nginx/sbin/nginx -g "daemon off;"
+CMD python3 /web/mapping.py & python3 /web/state_server.py & python3 /web/origin_server.py & /usr/local/nginx/sbin/nginx -g "daemon off;"

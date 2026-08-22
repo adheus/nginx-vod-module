@@ -147,3 +147,59 @@ test-local/
   test.sh          # smoke tests via curl
   NOTES.md         # this file
 ```
+
+## Remote mode — the ONLY path that exercises concurrent source reads
+
+`/local/hls/` and `/mapped/hls/` read media as **files**. The file reader is
+synchronous and binds its completion callback per *source* at open time, so any
+change to the read scheduler is **silently inactive** there: the code never runs
+and the tests pass anyway. Production uses the HTTP reader
+(`vod_remote_upstream_location`), and so does `/remote/hls/`.
+
+```bash
+# 6-stem mix over HTTP, 200ms synthetic TTFB per read
+curl -s -o /dev/null -w "%{time_total}\n" \
+  http://localhost:8080/remote/hls/r_song_full/seg-1-a1.ts
+
+# did reads actually overlap? peak_concurrent is the harness's own check
+docker exec vod-test python3 -c \
+  'import urllib.request;print(urllib.request.urlopen("http://127.0.0.1:8890/__stats__").read().decode())'
+docker exec vod-test python3 -c \
+  'import urllib.request;urllib.request.urlopen("http://127.0.0.1:8890/__reset__")'
+```
+
+Endpoints: `r_song_full` (6 stems — the benchmark), `r_song_vocals`,
+`r_song_key_up_2`. Also `/remote-nostate/hls/` to isolate read-scheduler
+behaviour from FFSA when bisecting.
+
+`ORIGIN_DELAY_MS` (default 200) is the synthetic time-to-first-byte. Without it,
+loopback reads cost ~0ms and serial vs concurrent are indistinguishable — the
+delay is what makes the win measurable at all.
+
+### Serial baseline, measured 2026-08-21 (before any concurrency work)
+
+| metric | value |
+|---|---|
+| `seg-1/2/3` wall time | **1.37 / 1.33 / 1.31 s** |
+| origin requests per segment | 6 (one per stem) |
+| **`peak_concurrent`** | **1** |
+
+1.3s ≈ 6 sources × 200ms — i.e. `N × delay`, the serial signature. After the
+concurrency work at cap=6 this should approach ~1 wave (~0.2-0.4s) and
+`peak_concurrent` should reach 6. **If `peak_concurrent` stays 1, the change is
+not doing anything**, regardless of what wall time says.
+
+### The correctness gate
+
+Output must be **bit-identical** across serial and concurrent builds — frame
+consumption order is independent of I/O completion order, so wrong-bytes-in-
+wrong-slot cannot survive an md5 A/B.
+
+```
+seg-1  51ca19b62da96c281006cb4555149672
+seg-2  2dea7f04bf1a59a68af214786b53e737
+seg-3  c478d9af872736ecacad32eba2d96d42
+```
+
+Note seg-1 over HTTP has the **same md5 as the local-file twin**
+(`/mapped/hls/song_full/seg-1-a1.ts`), so the two readers are also cross-checkable.
