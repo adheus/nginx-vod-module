@@ -11,6 +11,7 @@ read_cache_init(read_cache_state_t* state, request_context_t* request_context, s
 	state->buffer_count = 0;
 	state->reuse_buffers = TRUE;
 	state->target_buffer = NULL;
+	state->wait_buffer = NULL;
 }
 
 vod_status_t
@@ -92,6 +93,7 @@ read_cache_get_from_cache(
 		{
 			// miss, but nothing to issue - the caller has to wait for the read to complete
 			state->target_buffer = NULL;
+			state->wait_buffer = cur_buffer;
 			return FALSE;
 		}
 	}
@@ -123,6 +125,7 @@ read_cache_get_from_cache(
 	{
 		// the slot is busy with another read - the caller has to wait for it to complete
 		state->target_buffer = NULL;
+		state->wait_buffer = target_buffer;
 		return FALSE;
 	}
 

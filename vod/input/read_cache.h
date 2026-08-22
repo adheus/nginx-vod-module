@@ -23,6 +23,8 @@ typedef struct {
 	cache_buffer_t* buffers;
 	cache_buffer_t* buffers_end;
 	cache_buffer_t* target_buffer;
+	cache_buffer_t* wait_buffer;	// when read_cache_get_from_cache misses without generating a read
+									// demand, the in-flight slot the caller has to wait for
 	size_t buffer_count;
 	size_t buffer_size;
 	bool_t reuse_buffers;

@@ -21,4 +21,12 @@ vod_status_t filter_init_state(
 
 vod_status_t filter_run_state_machine(void* context);
 
+// enumerates the reads the currently-running audio filter needs in order to
+// decode each source's current frame (see audio_filter_get_pending_reads).
+// returns 0 when no audio filter is active
+size_t filter_get_pending_reads(
+	void* context,
+	read_cache_request_t* reads,
+	size_t max_reads);
+
 #endif // __FILTER_H__

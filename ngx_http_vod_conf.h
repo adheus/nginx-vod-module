@@ -56,6 +56,10 @@ struct ngx_http_vod_loc_conf_s {
 	size_t cache_buffer_size;
 	buffer_pool_t* output_buffer_pool;
 	size_t max_upstream_headers_size;
+	// max concurrently outstanding frame-data reads per request (min 1).
+	// enforced only at the batch-issuance site - the demand read and the
+	// mapping/DRM/FFSA child requests are never refused
+	ngx_uint_t max_concurrent_reads;
 	ngx_flag_t ignore_edit_list;
 	ngx_flag_t parse_hdlr_name;
 	ngx_flag_t parse_udta_name;

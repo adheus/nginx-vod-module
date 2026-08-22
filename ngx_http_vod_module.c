@@ -86,6 +86,12 @@ typedef struct ngx_http_vod_ctx_s ngx_http_vod_ctx_t;
 typedef ngx_int_t(*ngx_http_vod_state_machine_t)(ngx_http_vod_ctx_t* ctx);
 typedef ngx_int_t(*ngx_http_vod_open_file_t)(ngx_http_request_t* r, ngx_str_t* path, uint32_t flags, void** context);
 typedef ngx_int_t(*ngx_http_vod_async_read_func_t)(void* context, ngx_buf_t *buf, size_t size, off_t offset);
+// same as ngx_http_vod_async_read_func_t, but takes the completion callback explicitly
+// instead of hardcoding it, which is what allows several reads to be outstanding at
+// once. readers that bind their completion callback per-source at open time (the file
+// readers) leave this NULL and stay serial
+typedef ngx_int_t(*ngx_http_vod_async_read_ex_func_t)(void* context, ngx_buf_t *buf, size_t size, off_t offset,
+	ngx_child_request_callback_t callback, void* callback_context);
 typedef ngx_int_t(*ngx_http_vod_dump_part_t)(void* context, off_t start, off_t end);
 typedef size_t(*ngx_http_vod_get_size_t)(void* context);
 typedef void(*ngx_http_vod_get_path_t)(void* context, ngx_str_t* path);
@@ -142,12 +148,13 @@ struct ngx_http_vod_reader_s {
 	ngx_http_vod_get_path_t get_path;
 	ngx_http_vod_enable_directio_t enable_directio;
 	ngx_http_vod_async_read_func_t read;
+	ngx_http_vod_async_read_ex_func_t read_ex;	// optional - NULL means the reader cannot run concurrent reads
 };
 
 // a frame read issued on behalf of a read cache slot. one entry per slot, each
 // with its own buffer and perf counter context so completions can be routed to
-// their slot explicitly. Stage 1 still issues at most one read at a time -
-// concurrent issuance arrives in a later stage.
+// their slot explicitly. up to vod_max_concurrent_reads may be outstanding at
+// once during audio filtering (HTTP reader only - file readers stay serial).
 typedef struct {
 	cache_buffer_t* target;			// the read cache slot this read fills
 	ngx_buf_t buf;					// this read's own buffer (not the shared ctx->read_buffer)
@@ -228,6 +235,10 @@ struct ngx_http_vod_ctx_s {
 	size_t pending_read_capacity;
 	ngx_uint_t pending_read_count;
 	ngx_int_t pending_read_error;	// sticky first read error (NGX_OK = none)
+	read_cache_request_t* batch_read_requests;	// scratch for filter_get_pending_reads (pending_read_capacity entries)
+	cache_buffer_t* wait_read_target;	// the in-flight slot the frame processor is blocked on. while set,
+										// completions of OTHER slots must not re-run the frame processor -
+										// the audio decoder treats a re-entry without its data as truncation
 
 	// stateful-audio encoder state shuttle (opt-in via vod_encoder_state_location)
 	vod_audio_encoder_state_shuttle_t audio_state_shuttle;
@@ -263,6 +274,9 @@ static ngx_int_t ngx_http_vod_dump_http_part(void* context, off_t start, off_t e
 static ngx_int_t ngx_http_vod_dump_http_request(void* context);
 static void ngx_http_vod_http_reader_get_path(void* context, ngx_str_t* path);
 static ngx_int_t ngx_http_vod_async_http_read(ngx_http_vod_http_reader_state_t *state, ngx_buf_t *buf, size_t size, off_t offset);
+static ngx_int_t ngx_http_vod_async_http_read_ex(ngx_http_vod_http_reader_state_t *state, ngx_buf_t *buf, size_t size, off_t offset,
+	ngx_child_request_callback_t callback, void* callback_context);
+static void ngx_http_vod_handle_read_completed(void* context, ngx_int_t rc, ngx_buf_t* buf, ssize_t bytes_read);
 
 // globals
 ngx_module_t  ngx_http_vod_module = {
@@ -303,6 +317,7 @@ static ngx_http_vod_reader_t reader_file_with_fallback = {
 	ngx_file_reader_get_path,
 	(ngx_http_vod_enable_directio_t)ngx_file_reader_enable_directio,
 	(ngx_http_vod_async_read_func_t)ngx_async_file_read,
+	NULL,		// completion callback is bound per source at open time - serial only
 };
 
 static ngx_http_vod_reader_t reader_file = {
@@ -313,6 +328,7 @@ static ngx_http_vod_reader_t reader_file = {
 	ngx_file_reader_get_path,
 	(ngx_http_vod_enable_directio_t)ngx_file_reader_enable_directio,
 	(ngx_http_vod_async_read_func_t)ngx_async_file_read,
+	NULL,		// completion callback is bound per source at open time - serial only
 };
 
 static ngx_http_vod_reader_t reader_http = {
@@ -323,6 +339,7 @@ static ngx_http_vod_reader_t reader_http = {
 	ngx_http_vod_http_reader_get_path,
 	NULL,
 	(ngx_http_vod_async_read_func_t)ngx_http_vod_async_http_read,
+	(ngx_http_vod_async_read_ex_func_t)ngx_http_vod_async_http_read_ex,
 };
 
 static const u_char wvm_file_magic[] = { 0x00, 0x00, 0x01, 0xba, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01 };
@@ -3324,6 +3341,16 @@ ngx_http_vod_ensure_pending_reads(ngx_http_vod_ctx_t *ctx)
 		return ngx_http_vod_status_to_ngx_error(ctx->submodule_context.r, VOD_ALLOC_FAILED);
 	}
 
+	ctx->batch_read_requests = ngx_palloc(
+		ctx->submodule_context.request_context.pool,
+		sizeof(ctx->batch_read_requests[0]) * capacity);
+	if (ctx->batch_read_requests == NULL)
+	{
+		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->submodule_context.request_context.log, 0,
+			"ngx_http_vod_ensure_pending_reads: ngx_palloc failed");
+		return ngx_http_vod_status_to_ngx_error(ctx->submodule_context.r, VOD_ALLOC_FAILED);
+	}
+
 	ctx->pending_reads = pending_reads;
 	ctx->pending_read_capacity = capacity;
 
@@ -3357,14 +3384,20 @@ ngx_http_vod_find_pending_read(ngx_http_vod_ctx_t *ctx, ngx_buf_t* buf)
 			return cur;
 		}
 
-		if (match == NULL)
+		if (buf == NULL)
 		{
+			// no buf to match by (file reader completes with buf == NULL) -
+			// unambiguous only while a single read is outstanding
+			if (match != NULL)
+			{
+				return NULL;
+			}
+
 			match = cur;
 		}
 	}
 
-	// no buf to match by (file reader completes with buf == NULL) - with at most
-	// one read outstanding this is the read that just completed
+	// NULL when a buf was supplied but matched no slot
 	return match;
 }
 
@@ -3429,11 +3462,24 @@ ngx_http_vod_issue_pending_read(ngx_http_vod_ctx_t *ctx)
 	// perform the read
 	ngx_perf_counter_start(pending_read->perf_counter_context);
 
-	rc = read_buf.source->reader->read(
-		read_buf.source->reader_context,
-		&pending_read->buf,
-		read_buf.size,
-		read_buf.offset);
+	if (read_buf.source->reader->read_ex != NULL)
+	{
+		rc = read_buf.source->reader->read_ex(
+			read_buf.source->reader_context,
+			&pending_read->buf,
+			read_buf.size,
+			read_buf.offset,
+			ngx_http_vod_handle_read_completed,
+			ctx);
+	}
+	else
+	{
+		rc = read_buf.source->reader->read(
+			read_buf.source->reader_context,
+			&pending_read->buf,
+			read_buf.size,
+			read_buf.offset);
+	}
 	if (rc != NGX_OK)
 	{
 		if (rc != NGX_AGAIN)
@@ -3457,9 +3503,87 @@ ngx_http_vod_issue_pending_read(ngx_http_vod_ctx_t *ctx)
 	return NGX_OK;
 }
 
+// issues reads for the other sources' upcoming frames while the demand read is in
+// flight, so that they overlap instead of arriving one segment-latency at a time.
+// FILTER phase only - PROCESS_FRAMES (video/muxer) stays demand-driven. capped by
+// vod_max_concurrent_reads; errors are recorded sticky in ctx->pending_read_error
+// (the caller decides whether to drain or fail)
+static void
+ngx_http_vod_issue_batch_reads(ngx_http_vod_ctx_t *ctx)
+{
+	read_cache_request_t* requests = ctx->batch_read_requests;
+	media_clip_source_t* source;
+	size_t request_count;
+	size_t i;
+	uint32_t size;
+	u_char* buffer;
+	ngx_uint_t max_reads = ctx->submodule_context.conf->max_concurrent_reads;
+	ngx_int_t rc;
+
+	if (ctx->state != STATE_FILTER_FRAMES ||
+		ctx->frame_processor_state == NULL ||
+		requests == NULL)
+	{
+		return;
+	}
+
+	if (ctx->pending_read_count >= max_reads ||
+		ctx->pending_read_error != NGX_OK)
+	{
+		return;
+	}
+
+	request_count = filter_get_pending_reads(
+		ctx->frame_processor_state,
+		requests,
+		ctx->pending_read_capacity);
+
+	for (i = 0; i < request_count; i++)
+	{
+		if (ctx->pending_read_count >= max_reads)
+		{
+			break;
+		}
+
+		source = requests[i].source;
+		if (source->reader->read_ex == NULL)
+		{
+			// this reader binds its completion callback per source at open
+			// time and cannot run concurrently - leave it to the demand path
+			continue;
+		}
+
+		if (read_cache_get_from_cache(&ctx->read_cache_state, &requests[i], &buffer, &size))
+		{
+			// the needed bytes are already cached
+			continue;
+		}
+
+		if (!read_cache_has_pending_read(&ctx->read_cache_state))
+		{
+			// the needed bytes are already being read (or the slot is busy)
+			continue;
+		}
+
+		rc = ngx_http_vod_issue_pending_read(ctx);
+		if (rc == NGX_OK || rc == NGX_AGAIN)
+		{
+			continue;
+		}
+
+		// record the error sticky and stop issuing - the reads already in
+		// flight drain through their completions
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->submodule_context.request_context.log, 0,
+			"ngx_http_vod_issue_batch_reads: issue failed %i", rc);
+		ctx->pending_read_error = rc;
+		break;
+	}
+}
+
 static ngx_int_t
 ngx_http_vod_process_media_frames(ngx_http_vod_ctx_t *ctx)
 {
+	cache_buffer_t* demand_target;
 	vod_status_t rc;
 	ngx_int_t read_rc;
 
@@ -3471,8 +3595,30 @@ ngx_http_vod_process_media_frames(ngx_http_vod_ctx_t *ctx)
 
 	if (ctx->pending_read_error != NGX_OK)
 	{
-		// a previously issued read failed
+		// a previously issued read failed - wait for the reads still in
+		// flight to drain before surfacing the error, so the request is
+		// never finalized with children outstanding
+		if (ctx->pending_read_count > 0)
+		{
+			return NGX_AGAIN;
+		}
+
 		return ctx->pending_read_error;
+	}
+
+	if (ctx->wait_read_target != NULL)
+	{
+		if (ctx->wait_read_target->in_flight)
+		{
+			// the read the frame processor is blocked on has not landed yet -
+			// this completion belongs to another slot. progress on that slot's
+			// source is impossible anyway (the filter consumes sources in dts
+			// order), and re-entering the decoder without its data would
+			// falsely trip its truncated-file guard
+			return NGX_AGAIN;
+		}
+
+		ctx->wait_read_target = NULL;
 	}
 
 	for (;;)
@@ -3509,6 +3655,13 @@ ngx_http_vod_process_media_frames(ngx_http_vod_ctx_t *ctx)
 			ctx->write_segment_buffer_context.total_size >= ctx->size_limit &&
 			ctx->submodule_context.r->header_sent)
 		{
+			// drain gate: never report completion while reads are outstanding
+			// (no new reads are issued below this point on this path)
+			if (ctx->pending_read_count > 0)
+			{
+				return NGX_AGAIN;
+			}
+
 			return NGX_OK;
 		}
 
@@ -3516,7 +3669,12 @@ ngx_http_vod_process_media_frames(ngx_http_vod_ctx_t *ctx)
 		{
 			if (ctx->pending_read_count > 0)
 			{
-				// the needed bytes are already being read - wait for the completion
+				// the needed bytes are already being read (a batch read beat
+				// the demand to it) - block on that slot, top up the batch and
+				// wait. capture the slot before the batch runs its own
+				// read_cache_get_from_cache calls
+				ctx->wait_read_target = ctx->read_cache_state.wait_buffer;
+				ngx_http_vod_issue_batch_reads(ctx);
 				return NGX_AGAIN;
 			}
 
@@ -3526,13 +3684,48 @@ ngx_http_vod_process_media_frames(ngx_http_vod_ctx_t *ctx)
 			return ngx_http_vod_status_to_ngx_error(ctx->submodule_context.r, VOD_UNEXPECTED);
 		}
 
-		// issue the demanded read (still at most one read outstanding at a time)
+		// issue the demanded read. it is required for progress, so it is issued
+		// before (and regardless of) the concurrency cap. capture the target
+		// slot first - the frame processor is blocked on it
+		demand_target = ctx->read_cache_state.target_buffer;
+
 		read_rc = ngx_http_vod_issue_pending_read(ctx);
-		if (read_rc != NGX_OK)
+		if (read_rc == NGX_AGAIN)
 		{
-			// NGX_AGAIN = read is in flight, the completion re-enters the state machine
+			ctx->wait_read_target = demand_target;
+		}
+		else if (read_rc != NGX_OK)
+		{
+			if (ctx->pending_read_count > 0)
+			{
+				// let the reads in flight drain before failing
+				ctx->pending_read_error = read_rc;
+				return NGX_AGAIN;
+			}
+
 			return read_rc;
 		}
+
+		// batch-issue the other sources' reads, up to the cap (FILTER phase only)
+		ngx_http_vod_issue_batch_reads(ctx);
+
+		if (ctx->pending_read_error != NGX_OK)
+		{
+			if (ctx->pending_read_count > 0)
+			{
+				return NGX_AGAIN;
+			}
+
+			return ctx->pending_read_error;
+		}
+
+		if (ctx->pending_read_count > 0)
+		{
+			// reads are in flight - each completion re-enters the state machine
+			return NGX_AGAIN;
+		}
+
+		// everything completed synchronously - keep processing
 	}
 }
 
@@ -4640,7 +4833,6 @@ ngx_http_vod_handle_read_completed(void* context, ngx_int_t rc, ngx_buf_t* buf, 
 			if (ctx->pending_read_count > 0)
 			{
 				// swallow - the last completion finalizes the request
-				// (unreachable while at most one read is outstanding)
 				return;
 			}
 
@@ -4686,6 +4878,32 @@ ngx_http_vod_handle_read_completed(void* context, ngx_int_t rc, ngx_buf_t* buf, 
 			ngx_log_error(NGX_LOG_ERR, ctx->submodule_context.request_context.log, 0,
 				"ngx_http_vod_handle_read_completed: bytes read is zero");
 			rc = ngx_http_vod_status_to_ngx_error(ctx->submodule_context.r, VOD_BAD_DATA);
+
+			if (ctx->state == STATE_FILTER_FRAMES || ctx->state == STATE_PROCESS_FRAMES)
+			{
+				// a frame read came back empty - treat it like a failed read so
+				// the request is not finalized while other reads are in flight
+				pending_read = ngx_http_vod_find_pending_read(ctx, buf);
+				if (pending_read != NULL)
+				{
+					pending_read->active = 0;
+					ctx->pending_read_count--;
+				}
+
+				if (ctx->pending_read_error == NGX_OK)
+				{
+					ctx->pending_read_error = rc;
+				}
+
+				if (ctx->pending_read_count > 0)
+				{
+					// swallow - the last completion finalizes the request
+					return;
+				}
+
+				rc = ctx->pending_read_error;
+			}
+
 			goto finalize_request;
 		}
 	}
@@ -5165,7 +5383,8 @@ ngx_http_vod_dump_file(void* context)
 ////// Remote & mapped modes
 
 static ngx_int_t
-ngx_http_vod_async_http_read(ngx_http_vod_http_reader_state_t *state, ngx_buf_t *buf, size_t size, off_t offset)
+ngx_http_vod_async_http_read_ex(ngx_http_vod_http_reader_state_t *state, ngx_buf_t *buf, size_t size, off_t offset,
+	ngx_child_request_callback_t callback, void* callback_context)
 {
 	ngx_http_vod_ctx_t *ctx;
 	ngx_child_request_params_t child_params;
@@ -5182,11 +5401,27 @@ ngx_http_vod_async_http_read(ngx_http_vod_http_reader_state_t *state, ngx_buf_t 
 	return ngx_child_request_start(
 		state->r,
 		&ctx->child_hub,
-		ngx_http_vod_handle_read_completed,
-		ctx,
+		callback,
+		callback_context,
 		&state->upstream_location,
 		&child_params,
 		buf);
+}
+
+static ngx_int_t
+ngx_http_vod_async_http_read(ngx_http_vod_http_reader_state_t *state, ngx_buf_t *buf, size_t size, off_t offset)
+{
+	ngx_http_vod_ctx_t *ctx;
+
+	ctx = ngx_http_get_module_ctx(state->r, ngx_http_vod_module);
+
+	return ngx_http_vod_async_http_read_ex(
+		state,
+		buf,
+		size,
+		offset,
+		ngx_http_vod_handle_read_completed,
+		ctx);
 }
 
 static ngx_int_t

@@ -602,3 +602,19 @@ filter_run_state_machine(void* context)
 		}
 	}
 }
+
+size_t
+filter_get_pending_reads(
+	void* context,
+	read_cache_request_t* reads,
+	size_t max_reads)
+{
+	apply_filters_state_t* state = context;
+
+	if (state->audio_filter == NULL)
+	{
+		return 0;
+	}
+
+	return audio_filter_get_pending_reads(state->audio_filter, reads, max_reads);
+}
