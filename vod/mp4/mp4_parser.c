@@ -2881,6 +2881,26 @@ mp4_parser_process_moov_atom_callback(void* ctx, atom_info_t* atom_info)
 		}
 	}
 
+	// ...and the explicit default flag. The manifest builders read is_default off
+	// the TRACK (m3u8_builder.c ~:1025), and without this the media set's
+	// "default": true was silently dropped — so with unmuxed renditions the audio
+	// group came out AUTOSELECT=NO,DEFAULT=NO and a spec-following player would
+	// render video with no audio.
+	//
+	// Note the builders treat is_default < 0 as "unset" and fall back to "is this
+	// the first adaptation set", but metadata_parse_context is memzero'd above,
+	// so for mp4 tracks the field is 0 (false), never -1. That fallback is
+	// therefore dead here and explicit tagging is the only way to get
+	// DEFAULT=YES. Left alone deliberately: making mp4 default to -1 would flip
+	// every existing single-rendition manifest to DEFAULT=YES, which is a wider
+	// change than this fix needs.
+	//
+	// Guarded on >= 0 so a sequence that says nothing keeps today's behaviour.
+	if (sequence->tags.is_default >= 0)
+	{
+		metadata_parse_context.media_info.tags.is_default = sequence->tags.is_default;
+	}
+
 	// check whether we should include this track
 	track_index = context->track_indexes[metadata_parse_context.media_info.media_type]++;
 	if (!vod_is_bit_set(context->parse_params.required_tracks_mask[metadata_parse_context.media_info.media_type], track_index))

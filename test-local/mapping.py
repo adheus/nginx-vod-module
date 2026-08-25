@@ -292,6 +292,21 @@ MAPPINGS = {
     },
 
     # Video + audio mix from multi-track MP4
+    # Sparse-GOP video (keyframes every 10s) + 6-stem audio mix. Reproduces the
+    # production shape: source GOP much longer than vod_segment_duration, which
+    # is what splits video and audio onto different segment grids.
+    "sparse_muxed": {
+        "sequences": [
+            {"clips": [{"type": "source", "path": f"{MEDIA_DIR}/video_sparse.mp4"}]},
+            # "default": True marks this the default audio rendition. Without it
+            # the module emits AUTOSELECT=NO,DEFAULT=NO for any adaptation set
+            # that is not the first (m3u8_builder.c ~:889), and video is first —
+            # so a spec-following player would render video with no audio.
+            {"clips": [mix(*[stem(n) for n in ["vocals","bass","drums","guitars","piano","other"]])],
+             "default": True, "label": "Mix", "language": "eng"},
+        ],
+    },
+
     "mt_full": {
         "sequences": [
             {
