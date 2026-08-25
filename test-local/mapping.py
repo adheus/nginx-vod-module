@@ -39,6 +39,7 @@ def rstem(name):
     return {"type": "source", "path": f"/stems/{name}.m4a"}
 
 ALL_STEMS = ["vocals", "bass", "drums", "guitars", "piano", "other"]
+ALL_STEMS_L = ALL_STEMS
 
 def with_gain(gain, source):
     return {"type": "gainFilter", "gain": gain, "source": source}
@@ -305,6 +306,50 @@ MAPPINGS = {
             {"clips": [mix(*[stem(n) for n in ["vocals","bass","drums","guitars","piano","other"]])],
              "default": True, "label": "Mix", "language": "eng"},
         ],
+    },
+
+    # ---- tempo / speed-shift experiments -------------------------------
+    # Baseline: same sources as sparse_muxed, plain VOD, rate 1.0.
+    "tempo_base": {
+        "sequences": [
+            {"clips": [{"type": "source", "path": f"{MEDIA_DIR}/video_sparse.mp4"}]},
+            {"clips": [mix(*[stem(n) for n in ALL_STEMS_L])],
+             "default": True, "label": "Mix"},
+        ],
+    },
+
+    # rateFilter on both renditions, VOD. Answers: does atempo hold pitch, does
+    # video retime without re-encode, and — the new risk after unmuxing — does
+    # every video segment still START ON A KEYFRAME once timestamps are rescaled?
+    "tempo_125": {
+        "sequences": [
+            {"clips": [{"type": "rateFilter", "rate": 1.25,
+                        "source": {"type": "source", "path": f"{MEDIA_DIR}/video_sparse.mp4"}}]},
+            {"clips": [{"type": "rateFilter", "rate": 1.25,
+                        "source": mix(*[stem(n) for n in ALL_STEMS_L])}],
+             "default": True, "label": "Mix"},
+        ],
+    },
+
+    # EVENT playlist, rate 1.0. Answers: does the module emit
+    # EXT-X-PLAYLIST-TYPE:EVENT and omit EXT-X-ENDLIST, so a player keeps
+    # polling the SAME url? That is the whole basis for changing tempo without
+    # handing the client a new stream URL.
+    "tempo_event": {
+        "playlistType": "event",
+        "liveWindowDuration": -1,
+        "sequences": [
+            {"clips": [{"type": "source", "path": f"{MEDIA_DIR}/video_sparse.mp4"}]},
+            {"clips": [mix(*[stem(n) for n in ALL_STEMS_L])],
+             "default": True, "label": "Mix"},
+        ],
+    },
+
+    # minimal event: single audio sequence, nothing else, to isolate whether
+    # playlistType is honoured at all
+    "ev_min": {
+        "playlistType": "event",
+        "sequences": [{"clips": [stem("vocals")]}],
     },
 
     "mt_full": {
