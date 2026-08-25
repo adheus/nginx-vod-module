@@ -352,6 +352,37 @@ MAPPINGS = {
         "sequences": [{"clips": [stem("vocals")]}],
     },
 
+    # tempo compensation: pitch-shift the whole mix by +551 cents so that a
+    # client playing at 80/110 = 0.7273x (pitch correction OFF) lands back on
+    # the original pitch. 551 cents is what 110->80 BPM requires.
+    "comp_551": {
+        "sequences": [{"clips": [
+            {"type": "keyChangeFilter", "cents": 551,
+             "source": mix(*[stem(n) for n in ALL_STEMS_L])}
+        ]}],
+    },
+    # same shift expressed the old way, for A/B: 500 cents == 5 semitones
+    "comp_500": {
+        "sequences": [{"clips": [
+            {"type": "keyChangeFilter", "cents": 500,
+             "source": mix(*[stem(n) for n in ALL_STEMS_L])}
+        ]}],
+    },
+    "semi_5": {
+        "sequences": [{"clips": [
+            {"type": "keyChangeFilter", "semitones": 5,
+             "source": mix(*[stem(n) for n in ALL_STEMS_L])}
+        ]}],
+    },
+
+    # 440Hz tone, pitch-shifted by cents — used to verify the cents math
+    # end to end (expected out = 440 * 2^(cents/1200)).
+    "tone_0":   {"sequences": [{"clips": [{"type": "source", "path": f"{MEDIA_DIR}/tone_440hz.mp4"}]}]},
+    "tone_551": {"sequences": [{"clips": [{"type": "keyChangeFilter", "cents": 551,
+                  "source": {"type": "source", "path": f"{MEDIA_DIR}/tone_440hz.mp4"}}]}]},
+    "tone_1200":{"sequences": [{"clips": [{"type": "keyChangeFilter", "cents": 1200,
+                  "source": {"type": "source", "path": f"{MEDIA_DIR}/tone_440hz.mp4"}}]}]},
+
     "mt_full": {
         "sequences": [
             {

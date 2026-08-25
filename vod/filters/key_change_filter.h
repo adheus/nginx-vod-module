@@ -8,7 +8,12 @@
 // typedefs
 typedef struct {
 	media_clip_t base;
-	int32_t semitones;
+	// Pitch shift in cents (1/100 semitone). Whole semitones are just
+	// multiples of 100. Cents rather than semitones because BPM-target
+	// tempo compensation is never a whole semitone: 110->80 BPM needs
+	// +551.32 cents. Rounding to whole cents costs <=0.5c against a
+	// 5-10c JND, so it is inaudible.
+	int32_t cents;
 } media_clip_key_change_filter_t;
 
 // functions
