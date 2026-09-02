@@ -13,6 +13,7 @@
 #include "audio_decoder.h"
 #include "volume_map.h"
 #include "../input/frames_source_memory.h"
+#include "../input/frames_source_cache.h"
 
 // stateful-audio: compile-time probe for filter state API (patch 0006+0007)
 #if defined(LIBAVFILTER_VERSION_INT) && \
@@ -1805,6 +1806,50 @@ audio_filter_process(void* context)
 	}
 }
 
+size_t
+audio_filter_get_pending_reads(
+	void* context,
+	read_cache_request_t* reads,
+	size_t max_reads)
+{
+	frames_source_cache_state_t* frames_source_state;
+	audio_filter_state_t* state = context;
+	audio_filter_source_t* cur_source;
+	audio_decoder_state_t* decoder;
+	read_cache_request_t* reads_end = reads + max_reads;
+	read_cache_request_t* cur_read = reads;
+
+	for (cur_source = state->sources;
+		cur_source < state->sources_end && cur_read < reads_end;
+		cur_source++)
+	{
+		decoder = &cur_source->decoder;
+
+		if (!audio_decoder_has_frame(decoder))
+		{
+			// this source has no more frames in the segment
+			continue;
+		}
+
+		if (decoder->cur_frame_part.frames_source != &frames_source_cache)
+		{
+			// the frames don't come from the read cache (e.g. in-memory)
+			continue;
+		}
+
+		frames_source_state = decoder->cur_frame_part.frames_source_context;
+
+		cur_read->cache_slot_id = frames_source_state->req.cache_slot_id;
+		cur_read->source = frames_source_state->req.source;
+		cur_read->cur_offset = decoder->cur_frame->offset + decoder->cur_frame_pos;
+		cur_read->end_offset = decoder->cur_frame->offset + decoder->cur_frame->size;
+		cur_read->hint.min_offset = ULLONG_MAX;
+		cur_read++;
+	}
+
+	return cur_read - reads;
+}
+
 #else
 
 // empty stubs in case libavfilter/libavcodec are missing
@@ -1862,10 +1907,19 @@ audio_filter_free_state(void* context)
 {
 }
 
-vod_status_t 
+vod_status_t
 audio_filter_process(void* context)
 {
 	return VOD_UNEXPECTED;
+}
+
+size_t
+audio_filter_get_pending_reads(
+	void* context,
+	read_cache_request_t* reads,
+	size_t max_reads)
+{
+	return 0;
 }
 
 #endif

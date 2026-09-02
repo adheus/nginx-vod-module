@@ -29,6 +29,18 @@ STEMS_DIR = f"{MEDIA_DIR}/stems"
 def stem(name):
     return {"type": "source", "path": f"{STEMS_DIR}/{name}.m4a"}
 
+# --- remote mode -------------------------------------------------------
+# In remote mode the module builds the subrequest URI as
+#   vod_remote_upstream_location + path
+# (ngx_child_http_request.c:699-707), so `path` must NOT repeat the
+# location prefix. /origin_proxy/ strips itself before hitting
+# origin_server.py, which serves these straight out of /web/content.
+def rstem(name):
+    return {"type": "source", "path": f"/stems/{name}.m4a"}
+
+ALL_STEMS = ["vocals", "bass", "drums", "guitars", "piano", "other"]
+ALL_STEMS_L = ALL_STEMS
+
 def with_gain(gain, source):
     return {"type": "gainFilter", "gain": gain, "source": source}
 
@@ -196,6 +208,13 @@ MAPPINGS = {
     # Vocals only
     "song_vocals": seq(stem("vocals")),
 
+    # ---- remote-mode twins (HTTP reader; see origin_server.py) --------
+    # r_song_full is THE benchmark fixture: 6 sources => 6 serial reads
+    # today, ~1 wave once reads go concurrent.
+    "r_song_full": seq(mix(*[rstem(n) for n in ALL_STEMS])),
+    "r_song_vocals": seq(rstem("vocals")),
+    "r_song_key_up_2": seq(with_key(2, mix(*[rstem(n) for n in ALL_STEMS]))),
+
     # Instrumental — all stems except vocals
     "song_no_vocals": seq(mix(
         stem("bass"), stem("drums"), stem("guitars"),
@@ -274,6 +293,96 @@ MAPPINGS = {
     },
 
     # Video + audio mix from multi-track MP4
+    # Sparse-GOP video (keyframes every 10s) + 6-stem audio mix. Reproduces the
+    # production shape: source GOP much longer than vod_segment_duration, which
+    # is what splits video and audio onto different segment grids.
+    "sparse_muxed": {
+        "sequences": [
+            {"clips": [{"type": "source", "path": f"{MEDIA_DIR}/video_sparse.mp4"}]},
+            # "default": True marks this the default audio rendition. Without it
+            # the module emits AUTOSELECT=NO,DEFAULT=NO for any adaptation set
+            # that is not the first (m3u8_builder.c ~:889), and video is first —
+            # so a spec-following player would render video with no audio.
+            {"clips": [mix(*[stem(n) for n in ["vocals","bass","drums","guitars","piano","other"]])],
+             "default": True, "label": "Mix", "language": "eng"},
+        ],
+    },
+
+    # ---- tempo / speed-shift experiments -------------------------------
+    # Baseline: same sources as sparse_muxed, plain VOD, rate 1.0.
+    "tempo_base": {
+        "sequences": [
+            {"clips": [{"type": "source", "path": f"{MEDIA_DIR}/video_sparse.mp4"}]},
+            {"clips": [mix(*[stem(n) for n in ALL_STEMS_L])],
+             "default": True, "label": "Mix"},
+        ],
+    },
+
+    # rateFilter on both renditions, VOD. Answers: does atempo hold pitch, does
+    # video retime without re-encode, and — the new risk after unmuxing — does
+    # every video segment still START ON A KEYFRAME once timestamps are rescaled?
+    "tempo_125": {
+        "sequences": [
+            {"clips": [{"type": "rateFilter", "rate": 1.25,
+                        "source": {"type": "source", "path": f"{MEDIA_DIR}/video_sparse.mp4"}}]},
+            {"clips": [{"type": "rateFilter", "rate": 1.25,
+                        "source": mix(*[stem(n) for n in ALL_STEMS_L])}],
+             "default": True, "label": "Mix"},
+        ],
+    },
+
+    # EVENT playlist, rate 1.0. Answers: does the module emit
+    # EXT-X-PLAYLIST-TYPE:EVENT and omit EXT-X-ENDLIST, so a player keeps
+    # polling the SAME url? That is the whole basis for changing tempo without
+    # handing the client a new stream URL.
+    "tempo_event": {
+        "playlistType": "event",
+        "liveWindowDuration": -1,
+        "sequences": [
+            {"clips": [{"type": "source", "path": f"{MEDIA_DIR}/video_sparse.mp4"}]},
+            {"clips": [mix(*[stem(n) for n in ALL_STEMS_L])],
+             "default": True, "label": "Mix"},
+        ],
+    },
+
+    # minimal event: single audio sequence, nothing else, to isolate whether
+    # playlistType is honoured at all
+    "ev_min": {
+        "playlistType": "event",
+        "sequences": [{"clips": [stem("vocals")]}],
+    },
+
+    # tempo compensation: pitch-shift the whole mix by +551 cents so that a
+    # client playing at 80/110 = 0.7273x (pitch correction OFF) lands back on
+    # the original pitch. 551 cents is what 110->80 BPM requires.
+    "comp_551": {
+        "sequences": [{"clips": [
+            {"type": "keyChangeFilter", "cents": 551,
+             "source": mix(*[stem(n) for n in ALL_STEMS_L])}
+        ]}],
+    },
+    # same shift expressed the old way, for A/B: 500 cents == 5 semitones
+    "comp_500": {
+        "sequences": [{"clips": [
+            {"type": "keyChangeFilter", "cents": 500,
+             "source": mix(*[stem(n) for n in ALL_STEMS_L])}
+        ]}],
+    },
+    "semi_5": {
+        "sequences": [{"clips": [
+            {"type": "keyChangeFilter", "semitones": 5,
+             "source": mix(*[stem(n) for n in ALL_STEMS_L])}
+        ]}],
+    },
+
+    # 440Hz tone, pitch-shifted by cents — used to verify the cents math
+    # end to end (expected out = 440 * 2^(cents/1200)).
+    "tone_0":   {"sequences": [{"clips": [{"type": "source", "path": f"{MEDIA_DIR}/tone_440hz.mp4"}]}]},
+    "tone_551": {"sequences": [{"clips": [{"type": "keyChangeFilter", "cents": 551,
+                  "source": {"type": "source", "path": f"{MEDIA_DIR}/tone_440hz.mp4"}}]}]},
+    "tone_1200":{"sequences": [{"clips": [{"type": "keyChangeFilter", "cents": 1200,
+                  "source": {"type": "source", "path": f"{MEDIA_DIR}/tone_440hz.mp4"}}]}]},
+
     "mt_full": {
         "sequences": [
             {

@@ -56,6 +56,10 @@ struct ngx_http_vod_loc_conf_s {
 	size_t cache_buffer_size;
 	buffer_pool_t* output_buffer_pool;
 	size_t max_upstream_headers_size;
+	// max concurrently outstanding frame-data reads per request (min 1).
+	// enforced only at the batch-issuance site - the demand read and the
+	// mapping/DRM/FFSA child requests are never refused
+	ngx_uint_t max_concurrent_reads;
 	ngx_flag_t ignore_edit_list;
 	ngx_flag_t parse_hdlr_name;
 	ngx_flag_t parse_udta_name;
@@ -86,6 +90,15 @@ struct ngx_http_vod_loc_conf_s {
 	// Key format: "{media_set_id}/{sequence_index}/{segment_index}/{track_index}"
 	ngx_str_t encoder_state_location;
 	ngx_flag_t encoder_state_post_blocking;
+	// Whether to issue the state GET for segment 0, which by definition has no
+	// predecessor. Off by default: the key wraps to UINT32_MAX, the upstream
+	// has nothing to return, and the round trip is pure waste that also logs a
+	// spurious error (ngx_child_request maps the non-2xx to 502).
+	// Turn it ON when the upstream can synthesise a cold-start blob — e.g. a
+	// "silent-warmed" encoder state that lets segment 0 fade in naturally
+	// instead of emitting ~46 ms of AAC priming zeros. See
+	// test-local/state_server.py for that experiment.
+	ngx_flag_t encoder_state_cold_start_get;
 	size_t encoder_state_max_size;
 
 	time_t expires[EXPIRES_TYPE_COUNT];

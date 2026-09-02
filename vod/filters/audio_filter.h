@@ -3,6 +3,7 @@
 
 // includes
 #include "../media_set.h"
+#include "../input/read_cache.h"
 
 // typedefs
 struct audio_filter_s {
@@ -28,6 +29,15 @@ vod_status_t audio_filter_alloc_state(
 void audio_filter_free_state(void* context);
 
 vod_status_t audio_filter_process(void* context);
+
+// enumerates the reads each source needs in order to decode its current frame.
+// used to issue those reads concurrently instead of demand-serially; sources
+// whose frames do not come from the read cache are skipped. returns the number
+// of requests written to 'reads' (at most max_reads)
+size_t audio_filter_get_pending_reads(
+	void* context,
+	read_cache_request_t* reads,
+	size_t max_reads);
 
 vod_status_t audio_filter_alloc_memory_frame(
 	request_context_t* request_context,

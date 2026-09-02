@@ -89,6 +89,7 @@ ngx_http_vod_create_loc_conf(ngx_conf_t *cf)
 	conf->segment_max_frame_count = NGX_CONF_UNSET_UINT;
 	conf->cache_buffer_size = NGX_CONF_UNSET_SIZE;
 	conf->max_upstream_headers_size = NGX_CONF_UNSET_SIZE;
+	conf->max_concurrent_reads = NGX_CONF_UNSET_UINT;
 	conf->ignore_edit_list = NGX_CONF_UNSET;
 	conf->parse_hdlr_name = NGX_CONF_UNSET;
 	conf->parse_udta_name = NGX_CONF_UNSET;
@@ -122,6 +123,7 @@ ngx_http_vod_create_loc_conf(ngx_conf_t *cf)
 	// zero/null as "unset" without extra init, so only max_size needs this.
 	conf->encoder_state_max_size = NGX_CONF_UNSET_SIZE;
 	conf->encoder_state_post_blocking = NGX_CONF_UNSET;
+	conf->encoder_state_cold_start_get = NGX_CONF_UNSET;
 
 #if (NGX_THREADS)
 	conf->open_file_thread_pool = NGX_CONF_UNSET_PTR;
@@ -218,6 +220,11 @@ ngx_http_vod_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 	ngx_conf_merge_uint_value(conf->segment_max_frame_count, prev->segment_max_frame_count, 64 * 1024);
 	ngx_conf_merge_size_value(conf->cache_buffer_size, prev->cache_buffer_size, 256 * 1024);
 	ngx_conf_merge_size_value(conf->max_upstream_headers_size, prev->max_upstream_headers_size, 4 * 1024);
+	ngx_conf_merge_uint_value(conf->max_concurrent_reads, prev->max_concurrent_reads, 6);
+	if (conf->max_concurrent_reads < 1)
+	{
+		conf->max_concurrent_reads = 1;
+	}
 
 	if (conf->output_buffer_pool == NULL)
 	{
@@ -286,6 +293,7 @@ ngx_http_vod_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 	// stateful-audio hook
 	ngx_conf_merge_str_value(conf->encoder_state_location, prev->encoder_state_location, "");
 	ngx_conf_merge_value(conf->encoder_state_post_blocking, prev->encoder_state_post_blocking, 0);
+	ngx_conf_merge_value(conf->encoder_state_cold_start_get, prev->encoder_state_cold_start_get, 0);
 	ngx_conf_merge_size_value(conf->encoder_state_max_size, prev->encoder_state_max_size, 65536);
 
 	ngx_conf_merge_value(conf->last_modified_time, prev->last_modified_time, -1);
@@ -1096,6 +1104,13 @@ ngx_command_t ngx_http_vod_commands[] = {
 	offsetof(ngx_http_vod_loc_conf_t, max_upstream_headers_size),
 	NULL },
 
+	{ ngx_string("vod_max_concurrent_reads"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_conf_set_num_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, max_concurrent_reads),
+	NULL },
+
 	{ ngx_string("vod_upstream_location"),
 	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
 	ngx_conf_set_str_slot,
@@ -1130,6 +1145,13 @@ ngx_command_t ngx_http_vod_commands[] = {
 	ngx_conf_set_flag_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_vod_loc_conf_t, encoder_state_post_blocking),
+	NULL },
+
+	{ ngx_string("vod_encoder_state_cold_start_get"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_conf_set_flag_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, encoder_state_cold_start_get),
 	NULL },
 
 	{ ngx_string("vod_encoder_state_max_size"),
