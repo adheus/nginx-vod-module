@@ -203,3 +203,34 @@ seg-3  c478d9af872736ecacad32eba2d96d42
 
 Note seg-1 over HTTP has the **same md5 as the local-file twin**
 (`/mapped/hls/song_full/seg-1-a1.ts`), so the two readers are also cross-checkable.
+
+## Single-source read-ahead — the video fixtures
+
+The stem fixtures above issue **one read per source per segment**, so they can
+never show reads overlapping *within* a source. A high-bitrate video segment
+is the opposite shape: one source, several `vod_cache_buffer_size` chunks, and
+before read-ahead those chunks went one CDN round trip after another.
+
+`video_sparse.mp4` (1 Mbps, 10s GOP) served over the origin at a 256k cache
+buffer gives ~5 chunks per 10s video segment:
+
+| location | mapping | what it tests |
+|---|---|---|
+| `/ra/hls/` | `r_sparse_video` (video only), `r_sparse_muxed` (video + 6 stems, unmuxed renditions) | read-ahead in the muxer phase; default cap |
+| `/ra-serial/hls/` | same | `vod_max_concurrent_reads 1` = read-ahead off; **md5 twin for the A/B** |
+| `/ra-muxed/hls/`, `/ra-muxed-serial/hls/` | `r_sparse_muxed` as `seg-N-f1-v1-f2-a1.ts` | ONE request runs the stem FILTER phase and then the video muxer phase — the FILTER->PROCESS slot hand-off |
+| `/ra-state/hls/` | the `r_song_*` fixtures at a **64k** buffer, FFSA on | read-ahead inside the audio filter; output must equal the 256k references above |
+
+Video segments are keyframe-aligned: `seg-1/3/6/8/11/13-v1.ts`. The `/ra*/`
+locations are nostate, so serial-vs-concurrent md5s are order-independent.
+
+```bash
+# expect ~0.3s and peak_concurrent 5 on /ra, ~1.5s and peak 1 on /ra-serial (ORIGIN_DELAY_MS=300)
+curl -s -o /dev/null -w "%{time_total}\n" http://localhost:8080/ra/hls/r_sparse_video/seg-3-v1.ts
+```
+
+Two harness gotchas found here: `pkill`/`kill` binaries do not exist in the
+image (use `docker exec vod-test sh -c "kill -9 <pid>"`, and find the pid via
+`/proc/*/cmdline` — PID 1 also matches `origin_server.py` because it is the CMD
+shell, and SIGKILL to PID 1 is silently ignored), and the origin's range log is
+in `docker logs vod-test`, not in nginx's access.log (subrequests are not logged).
