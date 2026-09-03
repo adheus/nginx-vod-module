@@ -115,9 +115,10 @@ typedef struct {
 	uint64_t first_frame_time_offset;
 	int32_t clip_from_frame_offset;
 	input_frame_t* frames;
-	uint32_t frame_count;
+	uint32_t frame_count;			// includes trail_frame_count (stsz/stco need the trail too)
+	uint32_t trail_frame_count;		// audio post-roll frames at the end of `frames`
 	uint64_t total_frames_size;
-	uint64_t total_frames_duration;
+	uint64_t total_frames_duration;	// excludes the trail
 	uint32_t key_frame_count;
 	uint32_t first_chunk_frame_index;
 	bool_t chunk_equals_sample;
@@ -666,7 +667,52 @@ mp4_parser_parse_stts_atom_frame_duration_only(atom_info_t* atom_info, frames_pa
 	return VOD_OK;
 }
 
-static vod_status_t 
+// Audio post-roll: how many extra AAC frames to parse past the segment end for
+// sources that feed the audio filter graph. 11 frames (~0.25 s at 44.1 kHz) is
+// more than atempo's fixed W/2 = 1024-sample lookahead plus aresample's
+// half-filter for every allowed key-change ratio (0.5 < T < 2). The actual
+// count parsed is recorded on the track; the last segment gets less.
+#define MP4_AUDIO_POST_ROLL_FRAMES (11)
+
+// The post-roll only makes sense when the track is going to be decoded by the
+// audio filter (a source under a filter clip) in a real segment request. It
+// must never touch a track that is muxed as-is, a video track, a manifest
+// simulation, or a source that concat/dynamic will splice into a longer frame
+// list (the trail would land in the middle of the stream).
+static bool_t
+mp4_parser_audio_post_roll_enabled(frames_parse_context_t* context)
+{
+	media_clip_source_t* source = context->parse_params.source;
+	media_clip_t* clip;
+
+	if (context->media_info->media_type != MEDIA_TYPE_AUDIO ||
+		context->media_info->codec_id != VOD_CODEC_ID_AAC)
+	{
+		return FALSE;
+	}
+
+	if (context->request_context->simulation_only)
+	{
+		return FALSE;
+	}
+
+	if (source == NULL || source->base.parent == NULL)
+	{
+		return FALSE;
+	}
+
+	for (clip = source->base.parent; clip != NULL; clip = clip->parent)
+	{
+		if (clip->type == MEDIA_CLIP_CONCAT || clip->type == MEDIA_CLIP_DYNAMIC)
+		{
+			return FALSE;
+		}
+	}
+
+	return TRUE;
+}
+
+static vod_status_t
 mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* context)
 {
 	uint32_t timescale = context->media_info->timescale;
@@ -679,6 +725,8 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	uint64_t clip_from;
 	uint64_t start_time;
 	uint64_t end_time;
+	uint64_t parse_end_time;
+	uint64_t window_accum_duration;
 	uint64_t clip_to;
 	uint64_t clip_from_accum_duration = 0;
 	uint64_t accum_duration;
@@ -922,12 +970,23 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	first_frame = frame_index;
 	context->first_frame_time_offset = accum_duration;
 
+	// calculate the clip to (in the track timescale)
+	if (context->parse_params.clip_to == UINT_MAX)
+	{
+		clip_to = ULLONG_MAX;
+	}
+	else
+	{
+		clip_to = ((uint64_t)context->parse_params.clip_to * timescale) / range->timescale;
+	}
+
 	// calculate the end time and initial alloc size
 	initial_alloc_size = 128;
 
 	if (range->end == ULLONG_MAX)
 	{
 		end_time = ULLONG_MAX;
+		parse_end_time = ULLONG_MAX;
 
 		if (entries == 1)
 		{
@@ -938,6 +997,27 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	else
 	{
 		end_time = ((range->end + context->clip_from) * timescale) / range->timescale;
+
+		// audio post-roll: parse a few extra frames past the segment end so the
+		// audio filter graph can flush its lookahead (atempo W/2, aresample
+		// half-filter) with real input instead of losing it at the graph tear
+		// down. The extra frames are reported separately (trail_frame_count) and
+		// never change the segment window itself. The last segment of the file
+		// naturally gets less than requested; the count recorded below is what
+		// was actually parsed.
+		parse_end_time = end_time;
+		if (sample_duration != 0 && mp4_parser_audio_post_roll_enabled(context))
+		{
+			parse_end_time = end_time + (uint64_t)MP4_AUDIO_POST_ROLL_FRAMES * sample_duration;
+			if (parse_end_time < end_time)		// overflow
+			{
+				parse_end_time = end_time;
+			}
+			if (parse_end_time > clip_to)
+			{
+				parse_end_time = vod_max(clip_to, end_time);
+			}
+		}
 
 		if (entries == 1)
 		{
@@ -950,7 +1030,7 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 				return VOD_BAD_DATA;
 			}
 
-			initial_alloc_size = (end_time - start_time) / sample_duration + 1;
+			initial_alloc_size = (parse_end_time - start_time) / sample_duration + 1;
 			if (initial_alloc_size > sample_count)
 			{
 				initial_alloc_size = sample_count;
@@ -973,16 +1053,16 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		return VOD_ALLOC_FAILED;
 	}
 
-	// parse the frame durations until end time
-	if (accum_duration < end_time)
+	// parse the frame durations until end time (plus the audio post-roll, if any)
+	if (accum_duration < parse_end_time)
 	{
 		for (;;)
 		{
-			if (sample_duration != 0 && 
-				end_time != ULLONG_MAX && 
-				end_time < accum_duration + ((uint64_t)UINT_MAX) * sample_duration)
+			if (sample_duration != 0 &&
+				parse_end_time != ULLONG_MAX &&
+				parse_end_time < accum_duration + ((uint64_t)UINT_MAX) * sample_duration)
 			{
-				cur_count = vod_div_ceil(end_time - accum_duration, sample_duration);
+				cur_count = vod_div_ceil(parse_end_time - accum_duration, sample_duration);
 				cur_count = vod_min(cur_count, sample_count);
 			}
 			else
@@ -1015,7 +1095,7 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 				cur_frame->pts_delay = 0;
 			}
 
-			if (accum_duration >= end_time)
+			if (accum_duration >= parse_end_time)
 			{
 				break;
 			}
@@ -1032,13 +1112,28 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		}
 	}
 
-	if (context->parse_params.clip_to == UINT_MAX)
+	// audio post-roll: split what was parsed into the segment window (frames that
+	// start before end_time — the exact set the loop above produced before the
+	// post-roll existed) and the trail. Count from the frames themselves rather
+	// than assuming the requested constant: the file may have ended early.
+	window_accum_duration = accum_duration;
+	if (parse_end_time != end_time)
 	{
-		clip_to = ULLONG_MAX;
-	}
-	else
-	{
-		clip_to = ((uint64_t)context->parse_params.clip_to * timescale) / range->timescale;
+		uint64_t frame_start = context->first_frame_time_offset;
+		uint32_t window_count = 0;
+
+		for (cur_frame = frames_array.elts; window_count < frames_array.nelts; cur_frame++)
+		{
+			if (frame_start >= end_time)
+			{
+				break;
+			}
+			frame_start += cur_frame->duration;
+			window_count++;
+		}
+
+		window_accum_duration = frame_start;
+		context->trail_frame_count = frames_array.nelts - window_count;
 	}
 
 	// parse the frame durations until the next key frame
@@ -1144,13 +1239,13 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		return VOD_BAD_DATA;
 	}
 
-	context->total_frames_duration = accum_duration - context->first_frame_time_offset;
-	context->first_frame_time_offset -= clip_from_accum_duration;	
+	context->total_frames_duration = window_accum_duration - context->first_frame_time_offset;
+	context->first_frame_time_offset -= clip_from_accum_duration;
 	context->frames = frames_array.elts;
 	context->frame_count = frames_array.nelts;
 
 	if (clip_to != ULLONG_MAX &&
-		(cur_entry >= last_entry || (accum_duration - clip_from_accum_duration) > clip_to - clip_from))
+		(cur_entry >= last_entry || (window_accum_duration - clip_from_accum_duration) > clip_to - clip_from))
 	{
 		context->clip_to = context->parse_params.clip_to - context->parse_params.clip_from;
 	}
@@ -3233,6 +3328,7 @@ mp4_parser_parse_frames(
 	vod_array_t tracks;
 	uint64_t last_offset;
 	uint32_t media_type;
+	uint32_t window_frame_count;
 
 	if (vod_array_init(&tracks, request_context->pool, 2, sizeof(media_track_t)) != VOD_OK)
 	{
@@ -3396,18 +3492,24 @@ mp4_parser_parse_frames(
 #endif // VOD_HAVE_OPENSSL_EVP
 		}
 
+		// the audio post-roll trail stays behind frames.last_frame: only the audio
+		// filter's decoders (audio_decoder_init) extend their part over it, and
+		// only the read bound (source->last_offset) covers it
+		window_frame_count = context.frame_count - context.trail_frame_count;
+
 		result_track->frames.next = NULL;
 		result_track->frames.frames_source = frames_source;
 		result_track->frames.frames_source_context = frames_source_context;
 		result_track->frames.first_frame = context.frames;
-		result_track->frames.last_frame = context.frames + context.frame_count;
+		result_track->frames.last_frame = context.frames + window_frame_count;
 		result_track->frames.clip_to = context.clip_to;
 
 		// copy the result
 		result_track->media_info = cur_track->media_info;
 		result_track->encryption_info = context.encryption_info;
 		result_track->index = cur_track->track_index;
-		result_track->frame_count = context.frame_count;
+		result_track->frame_count = window_frame_count;
+		result_track->trail_frame_count = context.trail_frame_count;
 		result_track->key_frame_count = context.key_frame_count;
 		result_track->total_frames_size = context.total_frames_size;
 		result_track->total_frames_duration = context.total_frames_duration;
@@ -3416,11 +3518,18 @@ mp4_parser_parse_frames(
 		result_track->clip_from_frame_offset = context.clip_from_frame_offset;
 		result_track->source_clip = NULL;
 
-		// update the last offset of the source clip
-		if (context.frame_count > 0 && 
+		for (cur_frame = result_track->frames.last_frame, last_frame = context.frames + context.frame_count;
+			cur_frame < last_frame;
+			cur_frame++)
+		{
+			result_track->total_frames_size -= cur_frame->size;
+		}
+
+		// update the last offset of the source clip (includes the trail, it has to be readable)
+		if (context.frame_count > 0 &&
 			vod_all_flags_set(parse_params->parse_type, PARSE_FLAG_FRAMES_SIZE | PARSE_FLAG_FRAMES_OFFSET))
 		{
-			last_frame = result_track->frames.last_frame - 1;
+			last_frame = context.frames + context.frame_count - 1;
 			last_offset = last_frame->offset + last_frame->size;
 			if (last_offset > source->last_offset)
 			{

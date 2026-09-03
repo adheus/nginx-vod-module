@@ -136,12 +136,24 @@ static audio_filter_encoder_t volume_map_encoder = {
 
 #endif
 
+// audio post-roll: upper bound on avfilter_graph_request_oldest calls while
+// draining the graph after EOF, so a misbehaving filter can't spin forever
+#define AUDIO_FILTER_DRAIN_MAX_ITERATIONS (100000)
+
 typedef struct {
 	// phase 1
 	request_context_t* request_context;
 	uint32_t graph_desc_size;
 	uint32_t source_count;
 	uint32_t output_frame_count;
+
+	// audio post-roll: the sources must share one frame grid for a single
+	// keep/trail to hold across the graph. grid_state: 0 = no source yet,
+	// 1 = consistent so far, 2 = mismatch (post-roll and truncation disabled).
+	uint32_t grid_state;
+	uint32_t min_trail_frame_count;
+	uint32_t frames_timescale;
+	uint64_t window_duration;		// segment window in output time, frames_timescale units
 
 #if (VOD_HAVE_LIB_AV_CODEC && VOD_HAVE_LIB_AV_FILTER)
 	// phase 2
@@ -172,6 +184,9 @@ audio_filter_walk_filters_prepare_init(
 	vod_status_t rc;
 	uint32_t cur_frame_count;
 	uint32_t source_count;
+	uint32_t trail_frame_count;
+	uint32_t frames_timescale;
+	uint64_t window_duration;
 
 	if (media_clip_is_source(clip->type))
 	{
@@ -207,6 +222,44 @@ audio_filter_walk_filters_prepare_init(
 		if (state->output_frame_count < cur_frame_count)
 		{
 			state->output_frame_count = cur_frame_count;
+		}
+
+		// audio post-roll: record the segment window (in output time) and the
+		// trail this source carries, and check it against the other sources
+		frames_timescale = audio_track->media_info.frames_timescale != 0 ?
+			audio_track->media_info.frames_timescale : audio_track->media_info.timescale;
+		window_duration = ((uint64_t)audio_track->total_frames_duration * speed_denom) / speed_num;
+		trail_frame_count = audio_track->frames.next == NULL ? audio_track->trail_frame_count : 0;
+
+		switch (state->grid_state)
+		{
+		case 0:
+			state->grid_state = 1;
+			state->frames_timescale = frames_timescale;
+			state->window_duration = window_duration;
+			state->min_trail_frame_count = trail_frame_count;
+			break;
+
+		case 1:
+			if (frames_timescale != state->frames_timescale ||
+				window_duration != state->window_duration)
+			{
+				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+					"audio_filter_walk_filters_prepare_init: sources do not share a frame grid "
+					"(window %uL/%uD vs %uL/%uD), audio post-roll disabled for this segment",
+					window_duration, frames_timescale, state->window_duration, state->frames_timescale);
+				state->grid_state = 2;
+				state->min_trail_frame_count = 0;
+				break;
+			}
+
+			if (trail_frame_count < state->min_trail_frame_count)
+			{
+				state->min_trail_frame_count = trail_frame_count;
+			}
+			break;
+
+		default:;
 		}
 		return VOD_OK;
 	}
@@ -321,6 +374,20 @@ typedef struct {
 
 	// processing state
 	audio_filter_source_t* cur_source;
+
+	// audio post-roll. keep_samples is the segment window in sink samples; the
+	// sink forwards whole frames to the encoder until that many samples went
+	// through and drops everything the graph produces after it (the trail).
+	// 0 = unknown grid, no truncation. post_roll_active = every source feeds
+	// trail_frame_count frames past the window, so the graph's lookahead is
+	// satisfied with real input and the filter state at the end of the run
+	// is past the boundary (see audio_filter_process for what that implies).
+	bool_t post_roll_active;
+	uint32_t trail_frame_count;
+	uint64_t keep_samples;
+	uint64_t forwarded_samples;
+	uint64_t dropped_samples;
+	bool_t drained;
 } audio_filter_state_t;
 
 // globals
@@ -762,6 +829,7 @@ audio_filter_restore_state(
 	AVFilterGraph* graph,
 	audio_filter_source_t* sources,
 	audio_filter_source_t* sources_end,
+	bool_t skip_filter_state,
 	const u_char* blob,
 	size_t size,
 	const u_char** out_encoder_data,
@@ -806,7 +874,20 @@ audio_filter_restore_state(
 #if VOD_HAVE_FILTER_STATE_API
 		case VOD_FFSA_COMPONENT_ARESAMPLE:
 		{
-			AVFilterContext* f = audio_filter_find_by_name(graph, "aresample");
+			AVFilterContext* f;
+
+			if (skip_filter_state)
+			{
+				// audio post-roll: the previous segment's output already covers
+				// its whole window, restoring buffered filter input would
+				// replay it (see audio_filter_process)
+				vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+					"audio_filter_restore_state: aresample blob (%uz bytes) ignored, post-roll active",
+					blob_len);
+				break;
+			}
+
+			f = audio_filter_find_by_name(graph, "aresample");
 			if (f == NULL)
 			{
 				vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
@@ -834,7 +915,17 @@ audio_filter_restore_state(
 
 		case VOD_FFSA_COMPONENT_AMIX:
 		{
-			AVFilterContext* f = audio_filter_find_by_name(graph, "amix");
+			AVFilterContext* f;
+
+			if (skip_filter_state)
+			{
+				vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+					"audio_filter_restore_state: amix blob (%uz bytes) ignored, post-roll active",
+					blob_len);
+				break;
+			}
+
+			f = audio_filter_find_by_name(graph, "amix");
 			if (f == NULL)
 			{
 				vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
@@ -1144,6 +1235,7 @@ audio_filter_alloc_state(
 	u_char filter_name[VOD_INT32_LEN + 1];
 	audio_encoder_params_t encoder_params;
 	audio_filter_state_t* state;
+	audio_filter_source_t* cur_source;
 	vod_pool_cleanup_t *cln;
 	AVFilterLink* sink_link;
 	AVFilterInOut *outputs = NULL;
@@ -1154,6 +1246,7 @@ audio_filter_alloc_state(
 	int avrc;
 
 	// get the source count and graph desc size
+	vod_memzero(&init_context, sizeof(init_context));
 	init_context.request_context = request_context;
 	init_context.graph_desc_size = 0;
 	init_context.source_count = 0;
@@ -1252,6 +1345,16 @@ audio_filter_alloc_state(
 
 	*init_context.graph_desc_pos = '\0';
 
+	// audio post-roll: every decoder feeds exactly the same trail (the smallest
+	// one, so amix never sees one input end before the others), or none at all
+	// if the sources disagree on the grid / the last segment has no trail
+	state->post_roll_active = init_context.grid_state == 1 && init_context.min_trail_frame_count > 0;
+	state->trail_frame_count = state->post_roll_active ? init_context.min_trail_frame_count : 0;
+	for (cur_source = state->sources; cur_source < state->sources_end; cur_source++)
+	{
+		audio_decoder_set_trail(&cur_source->decoder, state->trail_frame_count);
+	}
+
 	// init the encoder
 	if (output_codec_id == VOD_CODEC_ID_VOLUME_MAP)
 	{
@@ -1314,6 +1417,21 @@ audio_filter_alloc_state(
 		goto end;
 	}
 
+	// audio post-roll: the segment window expressed in sink samples is where the
+	// sink stops forwarding to the encoder (audio_filter_read_filter_sink)
+	if (init_context.grid_state == 1 && init_context.frames_timescale != 0)
+	{
+		state->keep_samples = rescale_time(
+			init_context.window_duration, init_context.frames_timescale, sink_link->sample_rate);
+	}
+
+	vod_log_debug4(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+		"audio_filter_alloc_state: post-roll %s, trail %uD frames, keep %uL sink samples (window %uL)",
+		state->post_roll_active ? "active" : "inactive",
+		state->trail_frame_count,
+		state->keep_samples,
+		init_context.window_duration);
+
 	if (output_codec_id == VOD_CODEC_ID_VOLUME_MAP)
 	{
 		rc = volume_map_encoder_init(
@@ -1362,6 +1480,7 @@ audio_filter_alloc_state(
 				state->filter_graph,
 				state->sources,
 				state->sources_end,
+				state->post_roll_active,
 				request_context->audio_encoder_state_shuttle->state_in_data,
 				request_context->audio_encoder_state_shuttle->state_in_size,
 				&encoder_slice_data,
@@ -1608,6 +1727,21 @@ audio_filter_read_filter_sink(audio_filter_state_t* state)
 		audio_filter_append_debug_data("sink", "pcm", state->filtered_frame->data[0], data_size);
 #endif // AUDIO_FILTER_DEBUG
 
+		// audio post-roll: truncate AFTER the graph, at the sink. Whole frames
+		// are forwarded while the window is not complete (the sink frame size
+		// is pinned to the encoder's, so the encoder never sees a short frame
+		// mid-stream); once keep_samples went through, everything else — the
+		// trail, or the EOF flush — is dropped. Counted on sink frames, never
+		// on amix output (its sizing follows input 0).
+		if (state->keep_samples != 0 && state->forwarded_samples >= state->keep_samples)
+		{
+			state->dropped_samples += state->filtered_frame->nb_samples;
+			av_frame_unref(state->filtered_frame);
+			continue;
+		}
+
+		state->forwarded_samples += state->filtered_frame->nb_samples;
+
 		rc = state->sink.encoder->write(state->sink.encoder_context, state->filtered_frame);
 		if (rc != VOD_OK)
 		{
@@ -1616,6 +1750,63 @@ audio_filter_read_filter_sink(audio_filter_state_t* state)
 	}
 
 	return VOD_OK;
+}
+
+// audio post-roll: propagate EOF through the graph and pull everything it can
+// still produce (atempo's yae_flush tail, aresample's half filter, the sink's
+// partial). Safety net for segments without a trail — the last one of the
+// file, or a grid mismatch — where the post-roll can't do the job. The sink
+// keeps truncating at keep_samples, so with a trail this only mops up.
+static vod_status_t
+audio_filter_drain(audio_filter_state_t* state)
+{
+	vod_status_t rc;
+	int iterations;
+	int ret;
+
+	if (state->drained)
+	{
+		return VOD_OK;
+	}
+	state->drained = TRUE;
+
+	for (iterations = 0; iterations < AUDIO_FILTER_DRAIN_MAX_ITERATIONS; iterations++)
+	{
+		ret = avfilter_graph_request_oldest(state->filter_graph);
+		if (ret == AVERROR_EOF)
+		{
+			break;
+		}
+
+		if (ret == AVERROR(EAGAIN))
+		{
+			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+				"audio_filter_drain: graph stalled (EAGAIN) after EOF, %d iterations", iterations);
+			break;
+		}
+
+		if (ret < 0)
+		{
+			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+				"audio_filter_drain: avfilter_graph_request_oldest failed %d", ret);
+			return VOD_UNEXPECTED;
+		}
+
+		rc = audio_filter_read_filter_sink(state);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
+	}
+
+	if (iterations >= AUDIO_FILTER_DRAIN_MAX_ITERATIONS)
+	{
+		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+			"audio_filter_drain: giving up after %d iterations", iterations);
+	}
+
+	// the sink releases its sub-frame-size remainder only once its input status is set
+	return audio_filter_read_filter_sink(state);
 }
 
 static vod_status_t 
@@ -1658,6 +1849,15 @@ audio_filter_choose_source(audio_filter_state_t* state)
 	int ret;
 	vod_status_t rc;
 
+	// audio post-roll: the window is complete, whatever the trail could still
+	// produce is dropped anyway — no point decoding the rest of it
+	if (state->post_roll_active &&
+		state->keep_samples != 0 &&
+		state->forwarded_samples >= state->keep_samples)
+	{
+		return VOD_NOT_FOUND;
+	}
+
 	for (;;)
 	{
 		ret = avfilter_graph_request_oldest(state->filter_graph);
@@ -1693,7 +1893,10 @@ audio_filter_choose_source(audio_filter_state_t* state)
 		{
 			if (!sources_cur->buffersrc_flushed)
 			{
-				avrc = av_buffersrc_add_frame_flags(sources_cur->buffer_src, NULL, 0);
+				// AV_BUFFERSRC_FLAG_PUSH: without it av_buffersrc_close only
+				// flags the link and the EOF never reaches atempo/aresample
+				// before the graph is torn down
+				avrc = av_buffersrc_add_frame_flags(sources_cur->buffer_src, NULL, AV_BUFFERSRC_FLAG_PUSH);
 				if (avrc < 0)
 				{
 					vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
@@ -1702,6 +1905,12 @@ audio_filter_choose_source(audio_filter_state_t* state)
 				}
 
 				sources_cur->buffersrc_flushed = TRUE;
+
+				rc = audio_filter_read_filter_sink(state);
+				if (rc != VOD_OK)
+				{
+					return rc;
+				}
 			}
 			continue;
 		}
@@ -1716,6 +1925,13 @@ audio_filter_choose_source(audio_filter_state_t* state)
 
 	if (best_source == NULL)
 	{
+		// every source is at EOF — flush the graph before giving up on it
+		rc = audio_filter_drain(state);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
+
 		return VOD_NOT_FOUND;
 	}
 
@@ -1761,11 +1977,32 @@ audio_filter_process(void* context)
 				    state->request_context->audio_encoder_state_shuttle->state_out_data != NULL &&
 				    state->request_context->audio_encoder_state_shuttle->state_out_size != NULL)
 				{
-					audio_filter_capture_filter_state(
-						state->request_context,
-						state->filter_graph,
-						state->request_context->audio_encoder_state_shuttle->state_out_data,
-						state->request_context->audio_encoder_state_shuttle->state_out_size);
+					// audio post-roll: with a trail, the graph has consumed
+					// input PAST the segment boundary and the segment's output
+					// already accounts for every sample up to the boundary.
+					// aresample/amix state captured here (delay line, FIFO)
+					// holds input the next segment will push again from its
+					// first frame, so restoring it would replay ~one filter
+					// delay of audio at every boundary. There is no earlier
+					// point where their state is both boundary-aligned and
+					// restorable, so with the post-roll they start cold —
+					// which is what a count-exact segment needs. The encoder
+					// blob is unaffected: the encoder only ever saw the
+					// window's frames. The decoder blobs are snapshotted at
+					// the boundary inside audio_decoder.
+					if (state->post_roll_active)
+					{
+						vod_log_debug0(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
+							"audio_filter_process: post-roll active, filter state not captured");
+					}
+					else
+					{
+						audio_filter_capture_filter_state(
+							state->request_context,
+							state->filter_graph,
+							state->request_context->audio_encoder_state_shuttle->state_out_data,
+							state->request_context->audio_encoder_state_shuttle->state_out_size);
+					}
 
 					// Phase 28: append per-source AAC decoder blobs. Runs
 					// after filter capture so the final blob order is
@@ -1778,6 +2015,19 @@ audio_filter_process(void* context)
 						state->request_context->audio_encoder_state_shuttle->state_out_size);
 				}
 #endif
+
+				vod_log_debug4(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
+					"audio_filter_process: forwarded %uL sink samples (keep %uL), dropped %uL, drained %d",
+					state->forwarded_samples, state->keep_samples, state->dropped_samples, (int)state->drained);
+
+				if (state->keep_samples != 0 && state->forwarded_samples < state->keep_samples)
+				{
+					vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+						"audio_filter_process: segment window short by %uL sink samples "
+						"(forwarded %uL of %uL, trail %uD frames)",
+						state->keep_samples - state->forwarded_samples,
+						state->forwarded_samples, state->keep_samples, state->trail_frame_count);
+				}
 
 				return audio_filter_update_track(state);
 			}
@@ -1873,6 +2123,7 @@ audio_filter_alloc_state(
 	vod_status_t rc;
 
 	// get the source count and graph desc size
+	vod_memzero(&init_context, sizeof(init_context));
 	init_context.request_context = request_context;
 	init_context.graph_desc_size = 0;
 	init_context.source_count = 0;
