@@ -154,7 +154,8 @@ struct ngx_http_vod_reader_s {
 // a frame read issued on behalf of a read cache slot. one entry per slot, each
 // with its own buffer and perf counter context so completions can be routed to
 // their slot explicitly. up to vod_max_concurrent_reads may be outstanding at
-// once during audio filtering (HTTP reader only - file readers stay serial).
+// once during audio filtering and, via read-ahead within one source, during
+// muxing (HTTP reader only - file readers stay serial).
 typedef struct {
 	cache_buffer_t* target;			// the read cache slot this read fills
 	ngx_buf_t buf;					// this read's own buffer (not the shared ctx->read_buffer)
@@ -3505,7 +3506,8 @@ ngx_http_vod_issue_pending_read(ngx_http_vod_ctx_t *ctx)
 
 // issues reads for the other sources' upcoming frames while the demand read is in
 // flight, so that they overlap instead of arriving one segment-latency at a time.
-// FILTER phase only - PROCESS_FRAMES (video/muxer) stays demand-driven. capped by
+// FILTER phase only - PROCESS_FRAMES (video/muxer) has no per-source enumerator and
+// relies on demand + ngx_http_vod_issue_read_ahead. capped by
 // vod_max_concurrent_reads; errors are recorded sticky in ctx->pending_read_error
 // (the caller decides whether to drain or fail)
 static void
@@ -3575,6 +3577,48 @@ ngx_http_vod_issue_batch_reads(ngx_http_vod_ctx_t *ctx)
 		// flight drain through their completions
 		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->submodule_context.request_context.log, 0,
 			"ngx_http_vod_issue_batch_reads: issue failed %i", rc);
+		ctx->pending_read_error = rc;
+		break;
+	}
+}
+
+// issues read-ahead reads for a single source: the next contiguous byte ranges this
+// request still needs from it (bounded by source->last_offset), each into a free read
+// cache slot, while the demand read on that source is in flight. this is what makes a
+// video segment that spans several cache_buffer_size chunks fetch them concurrently
+// instead of one CDN round trip after another. applies in both phases (in the FILTER
+// phase after the per-source batch, which has priority), only through readers that
+// support read_ex, and only up to vod_max_concurrent_reads across demand + batch +
+// read-ahead. best-effort: stops silently when the cap, the free slots or the source
+// are exhausted. errors are recorded sticky like batch reads
+static void
+ngx_http_vod_issue_read_ahead(ngx_http_vod_ctx_t *ctx, media_clip_source_t* source, uint64_t from_offset)
+{
+	ngx_uint_t max_reads = ctx->submodule_context.conf->max_concurrent_reads;
+	ngx_int_t rc;
+
+	if (source == NULL ||
+		source->reader->read_ex == NULL ||
+		ctx->pending_read_error != NGX_OK)
+	{
+		return;
+	}
+
+	while (ctx->pending_read_count < max_reads)
+	{
+		if (!read_cache_prepare_read_ahead(&ctx->read_cache_state, source, from_offset))
+		{
+			break;
+		}
+
+		rc = ngx_http_vod_issue_pending_read(ctx);
+		if (rc == NGX_OK || rc == NGX_AGAIN)
+		{
+			continue;
+		}
+
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->submodule_context.request_context.log, 0,
+			"ngx_http_vod_issue_read_ahead: issue failed %i", rc);
 		ctx->pending_read_error = rc;
 		break;
 	}
@@ -3675,6 +3719,16 @@ ngx_http_vod_process_media_frames(ngx_http_vod_ctx_t *ctx)
 				// read_cache_get_from_cache calls
 				ctx->wait_read_target = ctx->read_cache_state.wait_buffer;
 				ngx_http_vod_issue_batch_reads(ctx);
+
+				// keep the pipeline on the awaited source full: the slots the
+				// consumer just moved past are free again
+				if (ctx->wait_read_target != NULL)
+				{
+					ngx_http_vod_issue_read_ahead(
+						ctx,
+						ctx->wait_read_target->source,
+						ctx->wait_read_target->start_offset);
+				}
 				return NGX_AGAIN;
 			}
 
@@ -3708,6 +3762,12 @@ ngx_http_vod_process_media_frames(ngx_http_vod_ctx_t *ctx)
 
 		// batch-issue the other sources' reads, up to the cap (FILTER phase only)
 		ngx_http_vod_issue_batch_reads(ctx);
+
+		// then read ahead on the demanded source, up to the cap (both phases)
+		ngx_http_vod_issue_read_ahead(
+			ctx,
+			demand_target->source,
+			demand_target->start_offset);
 
 		if (ctx->pending_read_error != NGX_OK)
 		{
@@ -4721,6 +4781,12 @@ ngx_http_vod_run_state_machine(ngx_http_vod_ctx_t *ctx)
 			{
 				return rc;
 			}
+
+			// the filtered audio now lives in memory and every read has drained
+			// (process_media_frames only returns NGX_OK with none in flight) -
+			// hand the slots, buffers included, to the muxer phase as its
+			// read-ahead pool
+			read_cache_release_buffers(&ctx->read_cache_state);
 		}
 
 		// initialize the processing of the video/audio frames

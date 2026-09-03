@@ -215,6 +215,25 @@ MAPPINGS = {
     "r_song_vocals": seq(rstem("vocals")),
     "r_song_key_up_2": seq(with_key(2, mix(*[rstem(n) for n in ALL_STEMS]))),
 
+    # ---- remote-mode VIDEO fixtures (single-source read-ahead) ---------
+    # The audio fixtures above have one read per source per segment, so they
+    # cannot show read-ahead *within* a source. video_sparse.mp4 is 1 Mbps with
+    # a 10s GOP: with vod_cache_buffer_size 256k a video segment spans ~5
+    # chunks of ONE source - serial today, concurrent with read-ahead.
+    # Served through /ra/hls/ (read-ahead on) and /ra-serial/hls/ (cap 1).
+    "r_sparse_video": seq({"type": "source", "path": "/video_sparse.mp4"}),
+
+    # production shape: sparse video + 6 remote stems, unmuxed renditions.
+    # exercises the FILTER->PROCESS slot hand-off (stem slots become the video
+    # read-ahead pool) on top of the video read-ahead itself.
+    "r_sparse_muxed": {
+        "sequences": [
+            {"clips": [{"type": "source", "path": "/video_sparse.mp4"}]},
+            {"clips": [mix(*[rstem(n) for n in ALL_STEMS])],
+             "default": True, "label": "Mix", "language": "eng"},
+        ],
+    },
+
     # Instrumental — all stems except vocals
     "song_no_vocals": seq(mix(
         stem("bass"), stem("drums"), stem("guitars"),
