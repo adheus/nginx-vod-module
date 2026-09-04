@@ -304,6 +304,11 @@ typedef struct media_track_s {
 	int64_t clip_start_time;
 	int64_t original_clip_time;
 	int32_t clip_from_frame_offset;
+	// audio post-roll (mp4 AAC only): number of valid input_frame_t entries that
+	// sit contiguously AFTER frames.last_frame, covering the source past the
+	// segment end. Only the audio filter's decoders consume them; every other
+	// consumer sees the track end exactly at frames.last_frame / frame_count.
+	uint32_t trail_frame_count;
 	raw_atom_t raw_atoms[RTA_COUNT];		// mp4 only
 	void* source_clip;
 	media_encryption_t encryption_info;

@@ -133,9 +133,24 @@ audio_decoder_init(
 		return VOD_ALLOC_FAILED;
 	}
 
-	// calculate the max frame size
+	state->cur_frame_part = track->frames;
+
+	// audio post-roll: the parser left trail_frame_count extra frames right
+	// after frames.last_frame (same contiguous array, single part). Extend this
+	// decoder's private copy of the part over them; the track itself is left
+	// untouched so every other consumer still sees the exact segment window.
+	state->trail_first_frame = NULL;
+	state->boundary_state_data = NULL;
+	state->boundary_state_size = 0;
+	if (track->trail_frame_count > 0 && track->frames.next == NULL)
+	{
+		state->trail_first_frame = track->frames.last_frame;
+		state->cur_frame_part.last_frame = track->frames.last_frame + track->trail_frame_count;
+	}
+
+	// calculate the max frame size (over the trail too)
 	state->max_frame_size = 0;
-	part = &track->frames;
+	part = &state->cur_frame_part;
 	last_frame = part->last_frame;
 	for (cur_frame = part->first_frame;; cur_frame++)
 	{
@@ -169,7 +184,6 @@ audio_decoder_init(
 	state->state_in_size = 0;
 	state->state_restored = 0;
 
-	state->cur_frame_part = track->frames;
 	state->cur_frame = track->frames.first_frame;
 	state->dts = track->first_frame_time_offset;
 
@@ -181,12 +195,51 @@ audio_decoder_init(
 }
 
 void
+audio_decoder_set_trail(
+	audio_decoder_state_t* state,
+	uint32_t trail_frame_count)
+{
+	if (state->trail_first_frame == NULL)
+	{
+		return;
+	}
+
+	if (trail_frame_count < (uint32_t)(state->cur_frame_part.last_frame - state->trail_first_frame))
+	{
+		state->cur_frame_part.last_frame = state->trail_first_frame + trail_frame_count;
+	}
+
+	if (trail_frame_count == 0)
+	{
+		state->trail_first_frame = NULL;
+	}
+}
+
+uint32_t
+audio_decoder_get_trail(audio_decoder_state_t* state)
+{
+	if (state->trail_first_frame == NULL)
+	{
+		return 0;
+	}
+
+	return (uint32_t)(state->cur_frame_part.last_frame - state->trail_first_frame);
+}
+
+void
 audio_decoder_free(audio_decoder_state_t* state)
 {
 	avcodec_close(state->decoder);
 	av_free(state->decoder);
 	state->decoder = NULL;
 	av_frame_free(&state->decoded_frame);
+
+	if (state->boundary_state_data != NULL)
+	{
+		av_free(state->boundary_state_data);
+		state->boundary_state_data = NULL;
+		state->boundary_state_size = 0;
+	}
 }
 
 // Send one packet into the decoder and try to receive one frame. Shared
@@ -317,6 +370,36 @@ audio_decoder_decode_frame(
 			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
 				"audio_decoder_decode_frame: restored state and re-decoded "
 				"first packet (size=%uz)", state->state_in_size);
+		}
+	}
+
+	// audio post-roll: the packet just decoded was the last one of the segment
+	// window — snapshot the decoder now, before any trail packet touches the
+	// IMDCT overlap. This is the state the next segment (which starts at the
+	// first trail packet) must restore; see audio_decoder_capture_state.
+	if (state->trail_first_frame != NULL &&
+	    state->cur_frame == state->trail_first_frame &&
+	    state->boundary_state_data == NULL)
+	{
+		uint8_t* blob = NULL;
+		size_t   blob_sz = 0;
+		int      grc = avcodec_get_decoder_state(state->decoder, &blob, &blob_sz);
+
+		if (grc >= 0 && blob != NULL && blob_sz > 0)
+		{
+			state->boundary_state_data = blob;
+			state->boundary_state_size = blob_sz;
+			vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
+				"audio_decoder_decode_frame: captured boundary decoder state (%uz bytes)", blob_sz);
+		}
+		else
+		{
+			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+				"audio_decoder_decode_frame: avcodec_get_decoder_state at the window boundary failed %d", grc);
+			if (blob != NULL)
+			{
+				av_free(blob);
+			}
 		}
 	}
 #endif
@@ -454,6 +537,27 @@ audio_decoder_capture_state(
 	}
 
 #if VOD_HAVE_DECODER_STATE_API
+	// audio post-roll: hand over the boundary snapshot (ownership moves to the
+	// caller), the live decoder state is past the segment window by now
+	if (state->boundary_state_data != NULL)
+	{
+		*out_data = state->boundary_state_data;
+		*out_size = state->boundary_state_size;
+		state->boundary_state_data = NULL;
+		state->boundary_state_size = 0;
+		return VOD_OK;
+	}
+
+	if (state->trail_first_frame != NULL)
+	{
+		// the decoder never reached the boundary (or the snapshot failed), so
+		// the live state would describe some other position in the stream —
+		// emit nothing rather than a wrong overlap
+		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+			"audio_decoder_capture_state: no boundary snapshot, skipping decoder blob");
+		return VOD_OK;
+	}
+
 	{
 		uint8_t* blob = NULL;
 		size_t   blob_sz = 0;

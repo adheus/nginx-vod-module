@@ -234,3 +234,105 @@ image (use `docker exec vod-test sh -c "kill -9 <pid>"`, and find the pid via
 `/proc/*/cmdline` — PID 1 also matches `origin_server.py` because it is the CMD
 shell, and SIGKILL to PID 1 is silently ignored), and the origin's range log is
 in `docker logs vod-test`, not in nginx's access.log (subrequests are not logged).
+
+## keyChangeFilter segment-boundary frame loss — local repro + measurement
+
+Production defect: with a `keyChangeFilter` in the mapping the module emits
+2-3 fewer AAC frames per 4 s segment, always at the segment TAIL, and the
+deficit accumulates into audio-behind-video drift. Without the filter the
+loss is zero. This section is the fast local loop for validating a fix
+(seconds per run instead of a 10 min cloud build).
+
+### What was added
+
+| file | purpose |
+|---|---|
+| `measure_gaps.sh` | the measurement tool: fetches N consecutive audio segments in order, ffprobes packet `pts_time`, prints frames / first / last / gap-from-previous per segment and a mean-frames-lost summary |
+| `mapping.py` → `dynamic_mapping()` | parametric fixtures resolved on the fly: `kc_s<N>` (semitones), `kc_c<N>` (cents), `kcps_s<N>` (per-stem shape), `r_` prefix = remote-reader twin. `kc_s0` is the no-filter baseline. Production shape (mux-session.ts `buildVodMapping`) is ONE keyChangeFilter wrapping the 6-stem `mixFilter`, which is what `kc_*` builds |
+| `nginx.conf` → `/prod/hls/` | production twin: remote reader + FFSA (blocking POST, 256k, no cold-start GET) + `vod_hls_force_unmuxed_segments on` + 4m cache buffer + accurate durations, no interleave |
+| `nginx.conf` → `/prod-nostate/hls/` | same without the FFSA hook, for bisecting filter-graph loss from state-shuttle loss |
+
+`nginx.conf` and `mapping.py` are BIND-MOUNTED into the container (see run
+line below), so config/fixture changes need only `docker restart`, not a
+rebuild. Only changes to `vod/*.c` or the ffmpeg patches need the image.
+
+### How to run
+
+```bash
+cd /Users/adheus/moises/nginx-vod-module
+
+# 1. build (ALWAYS --no-cache; ~2.5 min, the ffmpeg build is --disable-everything)
+docker build --no-cache -t vod-test:repro -f test-local/Dockerfile .
+
+# 2. run on :8081 (leaves the regular vod-test on :8080 alone), configs mounted,
+#    origin TTFB delay off so a segment costs ~60 ms instead of ~1.3 s
+docker rm -f vod-repro 2>/dev/null
+docker run -d --name vod-repro -p 8081:8080 -e ORIGIN_DELAY_MS=0 \
+  -v "$PWD/test-local/nginx.conf:/usr/local/nginx/conf/nginx.conf:ro" \
+  -v "$PWD/test-local/mapping.py:/web/mapping.py:ro" \
+  vod-test:repro
+sleep 3
+
+# 3. VERIFY the container runs the image you just built (stale images have
+#    produced false results before) — the two hashes must match
+docker inspect vod-repro --format '{{.Image}}'
+docker inspect vod-test:repro --format '{{.Id}}'
+
+# 4. measure: baseline, -1, +1, cents (tempo compensation)
+test-local/measure_gaps.sh r_kc_s0
+test-local/measure_gaps.sh r_kc_s-1
+test-local/measure_gaps.sh r_kc_s1
+test-local/measure_gaps.sh r_kc_c551
+
+# variants
+test-local/measure_gaps.sh -n 20 r_kc_s1                  # more segments
+test-local/measure_gaps.sh -l /prod-nostate/hls -c "" r_kc_s1   # FFSA off (-c "" = don't wipe blobs)
+test-local/measure_gaps.sh -l /mapped/hls kc_s1           # local file reader twin
+test-local/measure_gaps.sh r_kcps_s1                      # per-stem filter shape
+test-local/measure_gaps.sh -q r_kc_s1                     # summary lines only
+test-local/measure_gaps.sh -h
+```
+
+`measure_gaps.sh` wipes `/tmp/state-blobs` inside the container before each
+run (option `-c`), so every run starts a cold FFSA chain and every boundary
+is produced by that run. Because of that, do NOT run two FFSA measurements in
+parallel; `-c ""` skips the wipe (fine for `/prod-nostate/`).
+
+Columns: `gap_prev_ms = first_pts(n) - (last_pts(n-1) + 1024/44100)`, so a
+contiguous boundary is `0.00` and one missing frame is `+23.22`. `lost_fr`
+is the same gap in frames. The summary's "excluding seg1->2" line is the
+number to compare against production — the seg-1 boundary additionally
+carries the known cold-start priming frame.
+
+### Baseline numbers, fresh `--no-cache` image 2026-09-03 (fork @ 29385fe)
+
+`/prod/hls/` (production twin, FFSA on), 8 segments, boundaries 2->3 onward:
+
+| mapping | frames/seg | gap at each boundary | frames lost / boundary | prod. reference |
+|---|---|---|---|---|
+| `r_kc_s0` (no filter) | 172-173 | **0.00 ms** | **0.00** | ~172, ~0 ms |
+| `r_kc_s-1` | 170-171 | **+46.4 ms** | **2.00** | ~170, 23-70 ms, 1.80 |
+| `r_kc_s1` | 169-170 | **+69.7 ms** | **3.00** | ~169, 46-93 ms, 2.80 |
+| `r_kc_c551` (cents) | 168-169 | +69.7 / +92.9 ms | **3.50** | worst, 3.20 |
+
+The seg1->2 boundary is one frame worse in every row (+23 / +70 / +93 / +116 ms).
+
+`/prod-nostate/hls/` (FFSA off): every row is exactly ONE frame worse per
+boundary — `s0` = 1.00, `s-1` = 3.00, `s1` = 4.00, `c551` = 4.50. So the FFSA
+hook recovers the encoder-flush frame, and the 2-3 frame loss is in the
+`asetrate,aresample,atempo` chain itself, independent of the state shuttle
+and of the reader (`/mapped/hls/` local-file twin reproduces the same
+numbers: `kc_s-1` = 2.00). The per-stem shape (`r_kcps_s-1`, what a musical
+keyShift produces via `buildStemClip`) also loses frames but fewer — 1.25 per
+boundary, alternating +23 / +46 ms — so the whole-mix `kc_*` fixtures are the
+stronger signal.
+
+Two diagnostic facts visible in the output: `first_pts` of every segment is
+identical across all four mappings (4.118056, 8.111889, 12.105711, ...), so
+the segment START is pinned by the module's timeline and the whole loss is at
+the tail; and the playlist still declares `#EXTINF:4.000` for segments that
+carry 3.924 s of audio.
+
+A fix is validated when `r_kc_s-1`, `r_kc_s1` and `r_kc_c551` on `/prod/hls/`
+all report `0.00 frames lost/boundary` on the "excluding seg1->2" line and
+172-173 frames per segment, with `r_kc_s0` unchanged.

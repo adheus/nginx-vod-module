@@ -21,6 +21,7 @@ Real song endpoints (One Last Breath - Arrocha Remix, 6 stems):
 """
 
 import json
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 MEDIA_DIR = "/web/content"
@@ -423,6 +424,38 @@ MAPPINGS = {
 }
 
 
+# --- parametric keyChange fixtures (segment-boundary frame-loss repro) ------
+# Production wraps the WHOLE 6-stem mix in ONE keyChangeFilter
+# (moises-stream-server src/services/mux-session.ts buildVodMapping: tempo
+# compensation in cents wraps the mix; musical keyShift is applied per stem).
+# These names are resolved on the fly so a measurement run can pick any value
+# without editing this file:
+#
+#   kc_s<N>     mix of 6 stems, keyChangeFilter semitones=N wrapping the mix
+#   kc_c<N>     same, cents=N                    (N may be negative)
+#   kcps_s<N>   per-stem keyChangeFilter semitones=N on each stem, then mix
+#   kc_s0 / kc_c0 / kcps_s0 -> plain mix, no filter (the baseline)
+#
+# Prefix with r_ (r_kc_s-1, r_kcps_s1, ...) for the remote-reader twins used by
+# the /prod/hls/, /prod-nostate/hls/ and /remote/hls/ locations.
+KC_RE = re.compile(r"^(r_)?(kc|kcps)_([sc])(-?\d+)$")
+
+def dynamic_mapping(key):
+    m = KC_RE.match(key)
+    if not m:
+        return None
+    remote, shape, unit, val = m.group(1), m.group(2), m.group(3), int(m.group(4))
+    mk = rstem if remote else stem
+    param = "semitones" if unit == "s" else "cents"
+    if val == 0:
+        return seq(mix(*[mk(n) for n in ALL_STEMS]))
+    if shape == "kcps":
+        return seq(mix(*[{"type": "keyChangeFilter", param: val, "source": mk(n)}
+                         for n in ALL_STEMS]))
+    return seq({"type": "keyChangeFilter", param: val,
+                "source": mix(*[mk(n) for n in ALL_STEMS])})
+
+
 class MappingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         # nginx-vod-module sends the full URI path (minus HLS filename):
@@ -431,8 +464,9 @@ class MappingHandler(BaseHTTPRequestHandler):
         parts = [p for p in self.path.strip("/").split("/") if p]
         key = parts[-1] if parts else ""
 
-        if key in MAPPINGS:
-            body = json.dumps(MAPPINGS[key]).encode()
+        mapping = MAPPINGS.get(key) or dynamic_mapping(key)
+        if mapping is not None:
+            body = json.dumps(mapping).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

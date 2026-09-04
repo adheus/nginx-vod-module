@@ -36,6 +36,16 @@ typedef struct {
 	const u_char* state_in_data;
 	size_t        state_in_size;
 	int           state_restored;
+
+	// audio post-roll: the decoder's frame part is extended over the track's
+	// trail frames (media_track_t.trail_frame_count). trail_first_frame marks
+	// where the segment window ends inside the part (NULL = no trail). The
+	// Phase 28 decoder blob is snapshotted the moment the decoder crosses that
+	// mark (boundary_state_*), so the state shuttled to the next segment is the
+	// post-frame-(N-1) overlap it expects — not the state after the trail.
+	input_frame_t* trail_first_frame;
+	u_char*        boundary_state_data;
+	size_t         boundary_state_size;
 } audio_decoder_state_t;
 
 // functions
@@ -48,6 +58,16 @@ vod_status_t audio_decoder_init(
 	int cache_slot_id);
 
 void audio_decoder_free(audio_decoder_state_t* state);
+
+// audio post-roll: limit the trail this decoder will feed to the graph to
+// `trail_frame_count` frames (0 = stop exactly at the segment window, which is
+// the legacy behaviour). Must be called before the first audio_decoder_get_frame.
+void audio_decoder_set_trail(
+	audio_decoder_state_t* state,
+	uint32_t trail_frame_count);
+
+// audio post-roll: number of trail frames the decoder was initialised with
+uint32_t audio_decoder_get_trail(audio_decoder_state_t* state);
 
 vod_status_t audio_decoder_get_frame(
 	audio_decoder_state_t* state,
