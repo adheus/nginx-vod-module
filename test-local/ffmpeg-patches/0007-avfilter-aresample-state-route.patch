@@ -1,35 +1,39 @@
-From: stateful-audio <noreply@moises>
-Date: 2026-04-16
-Subject: [PATCH 0007] avfilter: route aresample filter state through
+From ae105c6eafe2cba8b98941be8d2381bb5e0e88d3 Mon Sep 17 00:00:00 2001
+From: stateful-audio <stateful-audio@ffmpeg.devel>
+Date: Sun, 19 Apr 2026 11:58:47 -0300
+Subject: [RFC PATCH 7/7] lavfi: route aresample filter state through
  swr_{get,set}_state
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-Extends avfilter_get_filter_state / avfilter_set_filter_state (added in
-0006) to also recognise the "aresample" filter. Internally, the helper
-reaches the filter's private AResampleContext (via a tiny accessor
-exported from af_aresample.c) and forwards to swr_get_state /
-swr_set_state, so the blob component_id is 0x0002 (FFSA_COMPONENT_ARESAMPLE)
-just as it would be for a bare SwrContext.
+Extend avfilter_get_filter_state / avfilter_set_filter_state (added in
+the previous patch) to also recognise the "aresample" filter.
+Internally the helper reaches the filter's private AResampleContext via
+a tiny accessor exported from af_aresample.c and forwards to
+swr_get_state / swr_set_state, so the blob's component_id is 0x0002
+(FFSA_COMPONENT_ARESAMPLE) just as it would be for a bare SwrContext.
 
 This lets callers snapshot the full audio filter graph state uniformly
-through a single API, avoiding having to know which filter wraps a
-SwrContext.
+through a single API — walk the filter chain, call
+avfilter_get_filter_state on each supported filter, concatenate the
+blobs — without having to know which filters wrap a SwrContext.
 
 No public API change in this patch; only widens which filters the
-already-declared avfilter_get_filter_state / avfilter_set_filter_state
-accept.
-
+already-declared avfilter_{get,set}_filter_state accept.
 ---
  libavfilter/af_aresample.c | 16 ++++++++++++++++
- libavfilter/avfilter.c     | 32 ++++++++++++++++++++++++++++++++
- 2 files changed, 48 insertions(+)
+ libavfilter/avfilter.c     | 29 +++++++++++++++++++++++++++++
+ 2 files changed, 45 insertions(+)
 
 diff --git a/libavfilter/af_aresample.c b/libavfilter/af_aresample.c
+index 7c6f914..3a775de 100644
 --- a/libavfilter/af_aresample.c
 +++ b/libavfilter/af_aresample.c
-@@ -43,6 +43,22 @@ typedef struct AResampleContext {
+@@ -45,6 +45,22 @@ typedef struct AResampleContext {
      int more_data;
  } AResampleContext;
-
+ 
 +/* ----------------------------------------- stateful-audio internal API --
 + *
 + * Accessor used by libavfilter/avfilter.c (avfilter_{get,set}_filter_state)
@@ -50,16 +54,13 @@ diff --git a/libavfilter/af_aresample.c b/libavfilter/af_aresample.c
  {
      AResampleContext *aresample = ctx->priv;
 diff --git a/libavfilter/avfilter.c b/libavfilter/avfilter.c
+index 4cf7892..c7ac61d 100644
 --- a/libavfilter/avfilter.c
 +++ b/libavfilter/avfilter.c
-@@ -47,10 +47,18 @@
- #include "framepool.h"
- #include "video.h"
-
- #if CONFIG_AMIX_FILTER
+@@ -50,6 +50,14 @@
  #include "af_amix_state.h"
  #endif
-
+ 
 +#if CONFIG_ARESAMPLE_FILTER
 +#include "libswresample/swresample.h"
 +/* Provided by libavfilter/af_aresample.c. Declared locally so we do not
@@ -75,7 +76,7 @@ diff --git a/libavfilter/avfilter.c b/libavfilter/avfilter.c
  #if CONFIG_AMIX_FILTER
      if (!strcmp(ctx->filter->name, "amix"))
          return ff_amix_get_state(ctx, buf, size);
- #endif
++#endif
 +#if CONFIG_ARESAMPLE_FILTER
 +    if (!strcmp(ctx->filter->name, "aresample")) {
 +        struct SwrContext *swr = ff_aresample_get_swr(ctx);
@@ -87,15 +88,14 @@ diff --git a/libavfilter/avfilter.c b/libavfilter/avfilter.c
 +        /* Produces an FFSA blob with component_id = 0x0002 (ARESAMPLE). */
 +        return swr_get_state(swr, buf, size);
 +    }
-+#endif
+ #endif
      return AVERROR(ENOSYS);
  }
-
-@@ -1039,6 +1059,18 @@ int avfilter_set_filter_state(AVFilterContext *ctx,
+@@ -1039,6 +1059,15 @@ int avfilter_set_filter_state(AVFilterContext *ctx,
  #if CONFIG_AMIX_FILTER
      if (!strcmp(ctx->filter->name, "amix"))
          return ff_amix_set_state(ctx, buf, size);
- #endif
++#endif
 +#if CONFIG_ARESAMPLE_FILTER
 +    if (!strcmp(ctx->filter->name, "aresample")) {
 +        struct SwrContext *swr = ff_aresample_get_swr(ctx);
@@ -104,7 +104,6 @@ diff --git a/libavfilter/avfilter.c b/libavfilter/avfilter.c
 +        /* Reader validates component_id = 0x0002 and config_hash match. */
 +        return swr_set_state(swr, buf, size);
 +    }
-+#endif
+ #endif
      return AVERROR(ENOSYS);
  }
-
