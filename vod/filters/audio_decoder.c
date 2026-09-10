@@ -229,9 +229,17 @@ audio_decoder_get_trail(audio_decoder_state_t* state)
 void
 audio_decoder_free(audio_decoder_state_t* state)
 {
-	avcodec_close(state->decoder);
-	av_free(state->decoder);
-	state->decoder = NULL;
+	// avcodec_free_context, not avcodec_close + av_free: on FFmpeg master
+	// avcodec_close is a no-op shim, so only the context struct was freed and
+	// the codec's priv_data/internal (~0.5MB for AAC) leaked on every segment.
+	// extradata points into the request pool (audio_decoder_init_decoder) and
+	// avcodec_free_context would av_freep it, so hand it back first.
+	if (state->decoder != NULL)
+	{
+		state->decoder->extradata = NULL;
+		state->decoder->extradata_size = 0;
+	}
+	avcodec_free_context(&state->decoder);
 	av_frame_free(&state->decoded_frame);
 
 	if (state->boundary_state_data != NULL)

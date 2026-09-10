@@ -209,8 +209,11 @@ audio_encoder_free(
 		return;
 	}
 	
-	avcodec_close(state->encoder);
-	av_free(state->encoder);
+	// avcodec_free_context, not avcodec_close + av_free: on FFmpeg master
+	// avcodec_close is a no-op shim, so the AAC encoder's priv_data (~0.6MB)
+	// leaked on every segment. The encoder owns its extradata (copied into the
+	// pool by audio_encoder_update_media_info), so it is safe to free.
+	avcodec_free_context(&state->encoder);
 }
 
 size_t

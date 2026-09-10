@@ -107,10 +107,15 @@ thumb_grabber_free_state(void* context)
 		av_freep(state->resize_buffer);
 	}
 	av_frame_free(&state->decoded_frame);
-	avcodec_close(state->encoder);
-	av_free(state->encoder);
-	avcodec_close(state->decoder);
-	av_free(state->decoder);
+	// Same leak as audio_decoder_free: avcodec_close is a no-op on FFmpeg
+	// master. The decoder's extradata points into the request pool.
+	avcodec_free_context(&state->encoder);
+	if (state->decoder != NULL)
+	{
+		state->decoder->extradata = NULL;
+		state->decoder->extradata_size = 0;
+	}
+	avcodec_free_context(&state->decoder);
 }
 
 static vod_status_t
