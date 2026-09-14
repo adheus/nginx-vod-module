@@ -3,7 +3,11 @@
 #include "../media_set_parser.h"
 
 // macros
-#define MIX_FILTER_DESC_PATTERN "amix=inputs=%uD[%uD]"
+// normalize=0: a plain sum, like the apps' native engines — stems at gain 1.0
+// add back up to the original mix. FFmpeg's default (normalize=1) scales every
+// input by 1/N, which made a 6-stem mix ~15.6 dB quieter than the apps at the
+// same fader positions.
+#define MIX_FILTER_DESC_PATTERN "amix=inputs=%uD:normalize=0[%uD]"
 #define INPUT_LINK_PATTERN "[%uD]"
 
 // typedefs
