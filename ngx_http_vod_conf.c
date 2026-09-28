@@ -90,6 +90,7 @@ ngx_http_vod_create_loc_conf(ngx_conf_t *cf)
 	conf->cache_buffer_size = NGX_CONF_UNSET_SIZE;
 	conf->max_upstream_headers_size = NGX_CONF_UNSET_SIZE;
 	conf->max_concurrent_reads = NGX_CONF_UNSET_UINT;
+	conf->parallel_metadata_reads = NGX_CONF_UNSET;
 	conf->ignore_edit_list = NGX_CONF_UNSET;
 	conf->parse_hdlr_name = NGX_CONF_UNSET;
 	conf->parse_udta_name = NGX_CONF_UNSET;
@@ -225,6 +226,7 @@ ngx_http_vod_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 	{
 		conf->max_concurrent_reads = 1;
 	}
+	ngx_conf_merge_value(conf->parallel_metadata_reads, prev->parallel_metadata_reads, 0);
 
 	if (conf->output_buffer_pool == NULL)
 	{
@@ -1109,6 +1111,13 @@ ngx_command_t ngx_http_vod_commands[] = {
 	ngx_conf_set_num_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_vod_loc_conf_t, max_concurrent_reads),
+	NULL },
+
+	{ ngx_string("vod_parallel_metadata_reads"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG,
+	ngx_conf_set_flag_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, parallel_metadata_reads),
 	NULL },
 
 	{ ngx_string("vod_upstream_location"),

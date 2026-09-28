@@ -336,3 +336,46 @@ carry 3.924 s of audio.
 A fix is validated when `r_kc_s-1`, `r_kc_s1` and `r_kc_c551` on `/prod/hls/`
 all report `0.00 frames lost/boundary` on the "excluding seg1->2" line and
 172-173 frames per segment, with `r_kc_s0` unchanged.
+
+## Parallel metadata reads — `vod_parallel_metadata_reads` A/B
+
+On a cold `master.m3u8` the module reads the header (and usually the moov) of
+every source one after another, so a cold master costs `N_sources x (1-2) x
+TTFB`. `vod_parallel_metadata_reads on` (default **off** in the module) issues
+those reads concurrently, capped by `vod_max_concurrent_reads`, HTTP reader
+only. Two locations differ ONLY in that directive, both are the `/prod/hls/`
+twin at production's `vod_initial_read_size 256k`:
+
+| location | directive | role |
+|---|---|---|
+| `/pm-off/hls/` | off | serial baseline |
+| `/pm-on/hls/` | on | the wave |
+
+**Cold cache without a restart:** prefix any mapping key with `cb<N>_`
+(`cb7_r_song_full`). `mapping.py` rewrites every remote source path to
+`/cb7/stems/...` and `origin_server.py` strips the prefix, so each N is a new
+source URI = a new `file_key` = a guaranteed metadata-cache miss for every
+source. The same N on both locations shares the cache (same keys), which is
+what the mixed-cache test relies on.
+
+Fixtures added for this: `r_mt_full` (multitrack over HTTP; 351 KB moov >
+256k, so all 7 sources take the second read), `r_nofs_video` / `r_nofs_muxed`
+(`media/video_nofs.mp4` = `video.mp4` remuxed without faststart, moov after a
+42 MB mdat — create it with
+`ffmpeg -i test-local/media/video.mp4 -c copy -movflags -faststart test-local/media/video_nofs.mp4`,
+it is not committed), `r_song_3` (half the stems, to warm a mixed cache),
+`r_song_full_404` / `r_song_full_500` (error arm: one stem the origin answers
+404 / 500 to).
+
+```bash
+docker rm -f vod-pmeta 2>/dev/null
+docker run -d --name vod-pmeta -p 8082:8080 -e ORIGIN_DELAY_MS=400 vod-test:pmeta && sleep 3
+test-local/measure_parallel_metadata.sh timing -n 5 r_song_full r_sparse_muxed r_mt_full r_nofs_muxed
+test-local/measure_parallel_metadata.sh identical r_song_full r_mt_full r_sparse_video r_nofs_muxed
+```
+
+`timing` prints wall time per cold master plus the origin's `peak_concurrent`
+for that run — `pm-off` must show 1, `pm-on` must show min(sources, cap).
+`identical` fetches master + every index playlist + the first 3 segments of
+every rendition on both locations (FFSA blobs wiped before each) and
+compares sha256s.
