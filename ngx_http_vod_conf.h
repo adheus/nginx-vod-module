@@ -56,10 +56,15 @@ struct ngx_http_vod_loc_conf_s {
 	size_t cache_buffer_size;
 	buffer_pool_t* output_buffer_pool;
 	size_t max_upstream_headers_size;
-	// max concurrently outstanding frame-data reads per request (min 1).
-	// enforced only at the batch-issuance site - the demand read and the
+	// max concurrently outstanding source reads per request (min 1): the
+	// frame-data batch during segment generation and, with
+	// parallel_metadata_reads, the metadata (moov) wave on a cold request.
+	// enforced only at those issuance sites - the demand read and the
 	// mapping/DRM/FFSA child requests are never refused
 	ngx_uint_t max_concurrent_reads;
+	// read the metadata (moov) of all sources concurrently instead of one
+	// source after another; capped by max_concurrent_reads, HTTP reader only
+	ngx_flag_t parallel_metadata_reads;
 	ngx_flag_t ignore_edit_list;
 	ngx_flag_t parse_hdlr_name;
 	ngx_flag_t parse_udta_name;

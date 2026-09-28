@@ -163,6 +163,45 @@ typedef struct {
 	ngx_perf_counter_context(perf_counter_context);
 } ngx_http_vod_pending_read_t;
 
+// a source's metadata read, used only with vod_parallel_metadata_reads. it holds
+// that source's copy of the ctx "read metadata state" block below; the block is
+// swapped into ctx while the source is advanced and back out afterwards, so the
+// serial read/identify/parse helpers run unchanged on one source at a time. buf
+// must not move while a read is in flight - the child request holds its address
+typedef struct ngx_http_vod_metadata_slot_s {
+	ngx_http_vod_ctx_t* ctx;
+	media_clip_source_t* source;
+
+	// an earlier slot with the same file_key that does the reading for this one;
+	// the serial loop gets the same effect through its cache hit on the second
+	// source, which cannot happen while both are in flight together
+	struct ngx_http_vod_metadata_slot_s* leader;
+
+	ngx_buf_t buf;
+	ngx_buf_t prefix_buffer;
+	uint32_t read_flags;
+	off_t requested_offset;
+	off_t read_offset;
+	size_t read_size;
+	media_format_t* format;
+	void* metadata_reader_context;
+	ngx_str_t* metadata_parts;
+	size_t metadata_part_count;
+
+	uint32_t cache_token;
+	unsigned active:1;			// a read is in flight
+	unsigned done:1;			// metadata parts are ready to parse
+	unsigned from_cache:1;		// parts came from the metadata cache (or are the "empty" file)
+	ngx_perf_counter_context(perf_counter_context);
+} ngx_http_vod_metadata_slot_t;
+
+enum {
+	METADATA_PHASE_INITIAL = 0,	// not decided yet
+	METADATA_PHASE_READING,		// the read wave is in flight
+	METADATA_PHASE_PARSE,		// the wave drained, sources await parsing
+	METADATA_PHASE_SERIAL,		// the serial loop owns the phase (default, or handed over)
+};
+
 struct ngx_http_vod_ctx_s {
 	// base params
 	ngx_http_vod_submodule_context_t submodule_context;
@@ -200,6 +239,15 @@ struct ngx_http_vod_ctx_s {
 	void* metadata_reader_context;
 	ngx_str_t* metadata_parts;
 	size_t metadata_part_count;
+
+	// parallel metadata reads (vod_parallel_metadata_reads)
+	int metadata_phase;
+	ngx_http_vod_metadata_slot_t* metadata_slots;
+	ngx_uint_t metadata_slot_count;
+	ngx_uint_t metadata_next;			// first slot whose initial read has not been issued
+	ngx_uint_t metadata_in_flight;
+	ngx_int_t metadata_read_error;		// sticky first error (NGX_OK = none)
+	ngx_http_vod_metadata_slot_t* metadata_cur;	// the slot being advanced - routes its reads to read_ex
 
 	// read frames state
 	media_base_metadata_t* base_metadata;
@@ -278,6 +326,8 @@ static ngx_int_t ngx_http_vod_async_http_read(ngx_http_vod_http_reader_state_t *
 static ngx_int_t ngx_http_vod_async_http_read_ex(ngx_http_vod_http_reader_state_t *state, ngx_buf_t *buf, size_t size, off_t offset,
 	ngx_child_request_callback_t callback, void* callback_context);
 static void ngx_http_vod_handle_read_completed(void* context, ngx_int_t rc, ngx_buf_t* buf, ssize_t bytes_read);
+static void ngx_http_vod_metadata_read_completed(void* context, ngx_int_t rc, ngx_buf_t* buf, ssize_t bytes_read);
+static ngx_int_t ngx_http_vod_issue_metadata_read(ngx_http_vod_ctx_t* ctx, media_clip_source_t* source, size_t size, off_t offset);
 
 // globals
 ngx_module_t  ngx_http_vod_module = {
@@ -2079,9 +2129,9 @@ ngx_http_vod_async_read(ngx_http_vod_ctx_t* ctx, media_format_read_request_t* re
 
 	ngx_perf_counter_start(ctx->perf_counter_context);
 
-	rc = ctx->cur_source->reader->read(
-		ctx->cur_source->reader_context,
-		&ctx->read_buffer,
+	rc = ngx_http_vod_issue_metadata_read(
+		ctx,
+		ctx->cur_source,
 		read_size - prefix_size,
 		read_offset + prefix_size);
 	if (rc != NGX_OK)
@@ -2400,27 +2450,633 @@ ngx_http_vod_get_alloc_params(ngx_http_vod_ctx_t* ctx, ngx_http_vod_reader_t* re
 	}
 }
 
-static ngx_int_t
-ngx_http_vod_open_file(ngx_http_vod_ctx_t* ctx, media_clip_source_t* source)
+static ngx_http_vod_reader_t*
+ngx_http_vod_get_reader(ngx_http_vod_ctx_t* ctx, media_clip_source_t* source)
 {
 	switch (source->source_type)
 	{
 	case MEDIA_CLIP_SOURCE_FILE:
-		source->reader = &reader_file;
-		break;
+		return &reader_file;
 
 	case MEDIA_CLIP_SOURCE_HTTP:
-		source->reader = &reader_http;
-		break;
+		return &reader_http;
 
 	default:	// MEDIA_CLIP_SOURCE_DEFAULT
-		source->reader = ctx->default_reader;
-		break;
+		return ctx->default_reader;
 	}
+}
+
+static ngx_int_t
+ngx_http_vod_open_file(ngx_http_vod_ctx_t* ctx, media_clip_source_t* source)
+{
+	source->reader = ngx_http_vod_get_reader(ctx, source);
 
 	ngx_http_vod_get_alloc_params(ctx, source->reader, &source->alignment, &source->alloc_extra_size);
 
 	return source->reader->open(ctx->submodule_context.r, &source->mapped_uri, 0, &source->reader_context);
+}
+
+////// Parallel metadata reads
+
+static void
+ngx_http_vod_metadata_slot_load(ngx_http_vod_ctx_t* ctx, ngx_http_vod_metadata_slot_t* slot)
+{
+	ctx->cur_source = slot->source;
+	ctx->read_buffer = slot->buf;
+	ctx->prefix_buffer = slot->prefix_buffer;
+	ctx->read_flags = slot->read_flags;
+	ctx->requested_offset = slot->requested_offset;
+	ctx->read_offset = slot->read_offset;
+	ctx->read_size = slot->read_size;
+	ctx->format = slot->format;
+	ctx->metadata_reader_context = slot->metadata_reader_context;
+	ctx->metadata_parts = slot->metadata_parts;
+	ctx->metadata_part_count = slot->metadata_part_count;
+}
+
+// slot->buf is left alone while a read is in flight: the child request owns it
+// and a reader that completes inline would have already updated it
+static void
+ngx_http_vod_metadata_slot_save(ngx_http_vod_ctx_t* ctx, ngx_http_vod_metadata_slot_t* slot)
+{
+	if (!slot->active)
+	{
+		slot->buf = ctx->read_buffer;
+	}
+	slot->prefix_buffer = ctx->prefix_buffer;
+	slot->read_flags = ctx->read_flags;
+	slot->requested_offset = ctx->requested_offset;
+	slot->read_offset = ctx->read_offset;
+	slot->read_size = ctx->read_size;
+	slot->format = ctx->format;
+	slot->metadata_reader_context = ctx->metadata_reader_context;
+	slot->metadata_parts = ctx->metadata_parts;
+	slot->metadata_part_count = ctx->metadata_part_count;
+}
+
+// issues a metadata read for source into ctx->read_buffer. in serial mode this is
+// the reader's plain read (completed through ngx_http_vod_handle_read_completed,
+// one outstanding at a time). while a parallel slot is being advanced the read
+// goes through read_ex into the slot's own buffer with the slot as completion
+// context, so several sources can be in flight at once
+static ngx_int_t
+ngx_http_vod_issue_metadata_read(ngx_http_vod_ctx_t* ctx, media_clip_source_t* source, size_t size, off_t offset)
+{
+	ngx_http_vod_metadata_slot_t* slot = ctx->metadata_cur;
+	ngx_int_t rc;
+
+	if (slot == NULL)
+	{
+		return source->reader->read(source->reader_context, &ctx->read_buffer, size, offset);
+	}
+
+	// snapshot the read state (offsets, flags, buffer) before the read is issued,
+	// so nothing is written to the slot behind an in-flight child
+	ngx_http_vod_metadata_slot_save(ctx, slot);
+	slot->active = 1;
+	ctx->metadata_in_flight++;
+
+	ngx_perf_counter_start(slot->perf_counter_context);
+
+	rc = source->reader->read_ex(
+		source->reader_context,
+		&slot->buf,
+		size,
+		offset,
+		ngx_http_vod_metadata_read_completed,
+		slot);
+	if (rc == NGX_AGAIN)
+	{
+		return rc;
+	}
+
+	// completed synchronously or failed to issue - nothing is in flight for this slot
+	slot->active = 0;
+	ctx->metadata_in_flight--;
+
+	if (rc == NGX_OK)
+	{
+		ngx_perf_counter_end(ctx->perf_counters, slot->perf_counter_context, PC_READ_FILE);
+		ctx->read_buffer = slot->buf;
+	}
+
+	return rc;
+}
+
+// feeds the data in slot->buf to the serial read-metadata step (identify the
+// format, run its metadata reader) and, when the reader asks for more - the moov
+// read - issues it from the same slot. NGX_OK = parts ready, NGX_AGAIN = in flight
+static ngx_int_t
+ngx_http_vod_metadata_slot_advance(ngx_http_vod_ctx_t* ctx, ngx_http_vod_metadata_slot_t* slot)
+{
+	ngx_int_t rc;
+
+	ngx_http_vod_metadata_slot_load(ctx, slot);
+	ctx->metadata_cur = slot;
+	rc = ngx_http_vod_read_metadata(ctx);
+	ctx->metadata_cur = NULL;
+	ngx_http_vod_metadata_slot_save(ctx, slot);
+
+	if (rc == NGX_OK)
+	{
+		slot->done = 1;
+	}
+	else if (rc != NGX_AGAIN)
+	{
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->submodule_context.request_context.log, 0,
+			"ngx_http_vod_metadata_slot_advance: ngx_http_vod_read_metadata failed %i", rc);
+	}
+
+	return rc;
+}
+
+// the initial read of one source - STATE_READ_METADATA_OPEN_FILE on the slot's own state
+static ngx_int_t
+ngx_http_vod_metadata_slot_start(ngx_http_vod_ctx_t* ctx, ngx_http_vod_metadata_slot_t* slot)
+{
+	ngx_http_vod_loc_conf_t* conf = ctx->submodule_context.conf;
+	media_clip_source_t* source = slot->source;
+	ngx_int_t rc;
+
+	ngx_http_vod_metadata_slot_load(ctx, slot);		// a fresh slot has no buffer - alloc allocates one
+
+	rc = ngx_http_vod_alloc_read_buffer(ctx, conf->initial_read_size + source->alloc_extra_size, source->alignment);
+	if (rc != NGX_OK)
+	{
+		return rc;
+	}
+
+	ctx->metadata_reader_context = NULL;
+	ctx->read_offset = 0;
+	ctx->read_size = conf->initial_read_size;
+	ctx->requested_offset = 0;
+	ctx->read_flags = MEDIA_READ_FLAG_ALLOW_EMPTY_READ;
+
+	ctx->metadata_cur = slot;
+	rc = ngx_http_vod_issue_metadata_read(ctx, source, conf->initial_read_size, 0);
+	ctx->metadata_cur = NULL;
+	ngx_http_vod_metadata_slot_save(ctx, slot);
+
+	if (rc == NGX_AGAIN)
+	{
+		return NGX_AGAIN;
+	}
+
+	if (rc != NGX_OK)
+	{
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->submodule_context.request_context.log, 0,
+			"ngx_http_vod_metadata_slot_start: async_read failed %i", rc);
+		return rc;
+	}
+
+	// completed synchronously
+	return ngx_http_vod_metadata_slot_advance(ctx, slot);
+}
+
+// tops the wave up to vod_max_concurrent_reads from the sources not yet issued
+static ngx_int_t
+ngx_http_vod_metadata_issue_pending(ngx_http_vod_ctx_t* ctx)
+{
+	ngx_uint_t max_reads = ctx->submodule_context.conf->max_concurrent_reads;
+	ngx_http_vod_metadata_slot_t* slot;
+	ngx_int_t rc;
+
+	while (ctx->metadata_next < ctx->metadata_slot_count && ctx->metadata_in_flight < max_reads)
+	{
+		slot = &ctx->metadata_slots[ctx->metadata_next++];
+		if (slot->done)
+		{
+			continue;		// resolved without a read (cache hit / empty file)
+		}
+
+		rc = ngx_http_vod_metadata_slot_start(ctx, slot);
+		if (rc != NGX_OK && rc != NGX_AGAIN)
+		{
+			return rc;
+		}
+	}
+
+	return NGX_OK;
+}
+
+// drops the metadata cache references held by pass A when the request fails
+// before pass C releases them; a held reference pins the entry in the cache
+static void
+ngx_http_vod_metadata_release_tokens(ngx_http_vod_ctx_t* ctx)
+{
+	ngx_http_vod_metadata_slot_t* slot;
+
+	for (slot = ctx->metadata_slots; slot < ctx->metadata_slots + ctx->metadata_slot_count; slot++)
+	{
+		if (slot->cache_token != 0)
+		{
+			ngx_buffer_cache_release(
+				ctx->submodule_context.conf->metadata_cache,
+				slot->source->file_key,
+				slot->cache_token);
+			slot->cache_token = 0;
+		}
+	}
+}
+
+// frees the metadata read buffers (a follower's parts point into its leader's,
+// so keep may name a buffer to spare) and clears the ctx copies left by the
+// last slot swap - ngx_http_vod_alloc_buf reuses a buffer whose start is set
+static void
+ngx_http_vod_metadata_free_buffers(ngx_http_vod_ctx_t* ctx, ngx_http_vod_metadata_slot_t* keep)
+{
+	ngx_http_vod_metadata_slot_t* slot;
+
+	for (slot = ctx->metadata_slots; slot < ctx->metadata_slots + ctx->metadata_slot_count; slot++)
+	{
+		if (slot == keep || slot->buf.start == NULL)
+		{
+			continue;
+		}
+
+		ngx_pfree(ctx->submodule_context.r->pool, slot->buf.start);
+		ngx_memzero(&slot->buf, sizeof(slot->buf));
+	}
+
+	ngx_memzero(&ctx->read_buffer, sizeof(ctx->read_buffer));
+	ngx_memzero(&ctx->prefix_buffer, sizeof(ctx->prefix_buffer));
+}
+
+// completion of one slot's read (initial or moov). errors are recorded sticky and
+// surfaced only once nothing is in flight: the request is never finalized with a
+// child outstanding - finalizing frees the pool the child hub lives in
+static void
+ngx_http_vod_metadata_read_completed(void* context, ngx_int_t rc, ngx_buf_t* buf, ssize_t bytes_read)
+{
+	ngx_http_vod_metadata_slot_t* slot = context;
+	ngx_http_vod_ctx_t* ctx = slot->ctx;
+
+	slot->active = 0;
+	ctx->metadata_in_flight--;
+
+	ngx_perf_counter_end(ctx->perf_counters, slot->perf_counter_context, ctx->perf_counter_async_read);
+
+	if (rc != NGX_OK)
+	{
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->submodule_context.request_context.log, 0,
+			"ngx_http_vod_metadata_read_completed: read failed %i", rc);
+		if (rc == NGX_AGAIN)
+		{
+			rc = ngx_http_vod_status_to_ngx_error(ctx->submodule_context.r, VOD_UNEXPECTED);
+		}
+	}
+	else if (bytes_read <= 0 && (slot->read_flags & MEDIA_READ_FLAG_ALLOW_EMPTY_READ) == 0)
+	{
+		ngx_log_error(NGX_LOG_ERR, ctx->submodule_context.request_context.log, 0,
+			"ngx_http_vod_metadata_read_completed: bytes read is zero");
+		rc = ngx_http_vod_status_to_ngx_error(ctx->submodule_context.r, VOD_BAD_DATA);
+	}
+	else if (ctx->metadata_read_error != NGX_OK)
+	{
+		// the request is already failing - just let the wave drain
+	}
+	else
+	{
+		if (buf != NULL)
+		{
+			slot->buf = *buf;
+		}
+
+		rc = ngx_http_vod_metadata_slot_advance(ctx, slot);
+		if (rc == NGX_AGAIN)
+		{
+			rc = NGX_OK;		// the moov read is in flight
+		}
+	}
+
+	if (rc != NGX_OK && ctx->metadata_read_error == NGX_OK)
+	{
+		ctx->metadata_read_error = rc;
+	}
+
+	if (ctx->metadata_read_error == NGX_OK)
+	{
+		rc = ngx_http_vod_metadata_issue_pending(ctx);
+		if (rc != NGX_OK)
+		{
+			ctx->metadata_read_error = rc;
+		}
+	}
+
+	if (ctx->metadata_in_flight > 0)
+	{
+		return;
+	}
+
+	if (ctx->metadata_read_error != NGX_OK)
+	{
+		ngx_http_vod_metadata_release_tokens(ctx);
+		rc = ctx->metadata_read_error;
+		goto finalize_request;
+	}
+
+	// the wave drained - parse, then carry on with the state machine
+	ctx->metadata_phase = METADATA_PHASE_PARSE;
+
+	rc = ctx->state_machine(ctx);
+	if (rc == NGX_AGAIN)
+	{
+		return;
+	}
+
+finalize_request:
+
+	ngx_http_vod_finalize_request(ctx, rc);
+}
+
+// The metadata phase as three passes instead of the serial loop in
+// ngx_http_vod_state_machine_parse_metadata. Why: on a cold master every source
+// (video + N stems) costs a round trip for its header and usually a second for
+// the moov, and the serial loop pays them one source after another, so a cold
+// master costs N x (1-2) round trips.
+//
+//   A - resolve every source in list order exactly as STATE_READ_METADATA_INITIAL
+//       does: "empty" / metadata cache hit pin the parts on the source's slot; a
+//       miss gets its initial read issued through read_ex with the slot as
+//       completion context, up to vod_max_concurrent_reads at once, the rest
+//       topped up as reads complete.
+//   B - ngx_http_vod_metadata_read_completed: feed the data to the format's
+//       metadata reader; if it asks for the moov, issue that from the same slot.
+//   C - once nothing is in flight, parse every source in list order, store the
+//       read ones in the cache and free their buffers - the same order and the
+//       same side effects as the serial loop, so everything downstream sees the
+//       same tracks in the same order.
+//
+// Stays serial: clipper requests (ctx->request == NULL keeps the parts and the
+// buffer alive past this phase), readers without read_ex (file readers bind
+// their completion per source at open), and a source whose parse asks for a
+// frames read (mkv) - that one hands itself and the rest back to the serial
+// loop. Returns NGX_DECLINED to run the serial loop, NGX_OK when every source is
+// parsed, NGX_AGAIN while the wave is in flight.
+static ngx_int_t
+ngx_http_vod_parallel_metadata(ngx_http_vod_ctx_t* ctx)
+{
+	ngx_http_vod_loc_conf_t* conf = ctx->submodule_context.conf;
+	ngx_http_vod_metadata_slot_t* leader;
+	ngx_http_vod_metadata_slot_t* slot;
+	multipart_cache_header_t multipart_header;
+	media_clip_source_t* cur_source;
+	ngx_http_request_t* r = ctx->submodule_context.r;
+	ngx_uint_t count;
+	ngx_int_t rc;
+
+	switch (ctx->metadata_phase)
+	{
+	case METADATA_PHASE_SERIAL:
+		return NGX_DECLINED;
+
+	case METADATA_PHASE_READING:
+		return NGX_AGAIN;
+
+	case METADATA_PHASE_PARSE:
+		goto parse;
+
+	default:
+		break;
+	}
+
+	// decide once, at the start of the phase
+	if (!conf->parallel_metadata_reads ||
+		ctx->request == NULL ||
+		ctx->state != STATE_READ_METADATA_INITIAL ||
+		ctx->cur_source != ctx->submodule_context.media_set.sources_head)
+	{
+		ctx->metadata_phase = METADATA_PHASE_SERIAL;
+		return NGX_DECLINED;
+	}
+
+	count = 0;
+	for (cur_source = ctx->cur_source; cur_source != NULL; cur_source = cur_source->next)
+	{
+		if (ngx_http_vod_get_reader(ctx, cur_source)->read_ex == NULL)
+		{
+			ctx->metadata_phase = METADATA_PHASE_SERIAL;
+			return NGX_DECLINED;
+		}
+		count++;
+	}
+
+	ctx->metadata_slots = ngx_pcalloc(ctx->submodule_context.request_context.pool, sizeof(ctx->metadata_slots[0]) * count);
+	if (ctx->metadata_slots == NULL)
+	{
+		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+			"ngx_http_vod_parallel_metadata: ngx_pcalloc failed");
+		return ngx_http_vod_status_to_ngx_error(r, VOD_ALLOC_FAILED);
+	}
+	ctx->metadata_slot_count = count;
+	ctx->metadata_phase = METADATA_PHASE_READING;
+
+	r->connection->log->action = "reading media header";
+
+	// pass A
+	slot = ctx->metadata_slots;
+	for (cur_source = ctx->cur_source; cur_source != NULL; cur_source = cur_source->next, slot++)
+	{
+		slot->ctx = ctx;
+		slot->source = cur_source;
+		ngx_memzero(&multipart_header, sizeof(multipart_header));
+
+		if (cur_source->mapped_uri.len == empty_file_string.len &&
+			ngx_strncasecmp(cur_source->mapped_uri.data, empty_file_string.data, empty_file_string.len) == 0)
+		{
+			// the string "empty" identifies an empty srt file
+			slot->metadata_parts = ngx_palloc(ctx->submodule_context.request_context.pool,
+				sizeof(*slot->metadata_parts) + 1);
+			if (slot->metadata_parts == NULL)
+			{
+				ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+					"ngx_http_vod_parallel_metadata: ngx_palloc failed");
+				ngx_http_vod_metadata_release_tokens(ctx);
+				return ngx_http_vod_status_to_ngx_error(r, VOD_ALLOC_FAILED);
+			}
+
+			slot->metadata_parts[0].len = 0;
+			slot->metadata_parts[0].data = (void*)(slot->metadata_parts + 1);
+			slot->metadata_parts[0].data[0] = '\0';
+			slot->metadata_part_count = 1;
+			multipart_header.type = FORMAT_ID_WEBVTT;
+			slot->from_cache = 1;
+		}
+		else if (conf->metadata_cache != NULL &&
+			ngx_buffer_cache_fetch_multipart_perf(
+				ctx,
+				conf->metadata_cache,
+				cur_source->file_key,
+				&multipart_header,
+				&slot->metadata_parts,
+				&slot->cache_token))
+		{
+			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+				"ngx_http_vod_parallel_metadata: metadata cache hit");
+			slot->metadata_part_count = multipart_header.part_count;
+			slot->from_cache = 1;
+		}
+
+		if (slot->from_cache)
+		{
+			rc = ngx_http_vod_init_format(ctx, multipart_header.type);
+			if (rc != NGX_OK)
+			{
+				ngx_http_vod_metadata_release_tokens(ctx);
+				return rc;
+			}
+
+			slot->format = ctx->format;
+			slot->done = 1;
+		}
+		else
+		{
+			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+				"ngx_http_vod_parallel_metadata: metadata cache miss");
+
+			for (leader = ctx->metadata_slots; leader < slot; leader++)
+			{
+				if (!leader->from_cache &&
+					leader->leader == NULL &&
+					ngx_memcmp(leader->source->file_key, cur_source->file_key, MEDIA_CLIP_KEY_SIZE) == 0)
+				{
+					slot->leader = leader;
+					slot->done = 1;		// parsed from the leader's parts in pass C
+					break;
+				}
+			}
+		}
+
+		// open every source, cache hit or not. the serial loop opens only the
+		// sources it reads; the ones it skips are opened by
+		// ngx_http_vod_state_machine_open_files later, which is a no-op for a
+		// source already open, so the end state is the same
+		rc = ngx_http_vod_open_file(ctx, cur_source);
+		if (rc != NGX_OK)
+		{
+			if (rc != NGX_AGAIN)
+			{
+				ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+					"ngx_http_vod_parallel_metadata: open_file failed %i", rc);
+			}
+			ngx_http_vod_metadata_release_tokens(ctx);
+			return rc;
+		}
+	}
+
+	rc = ngx_http_vod_metadata_issue_pending(ctx);
+	if (rc != NGX_OK)
+	{
+		if (ctx->metadata_in_flight > 0)
+		{
+			// let the reads already issued drain; their last completion surfaces the error
+			ctx->metadata_read_error = rc;
+			return NGX_AGAIN;
+		}
+
+		ngx_http_vod_metadata_release_tokens(ctx);
+		return rc;
+	}
+
+	if (ctx->metadata_in_flight > 0)
+	{
+		return NGX_AGAIN;
+	}
+
+	// every source was resolved without a read
+	ctx->metadata_phase = METADATA_PHASE_PARSE;
+
+parse:
+
+	// pass C
+	for (slot = ctx->metadata_slots; slot < ctx->metadata_slots + ctx->metadata_slot_count; slot++)
+	{
+		cur_source = slot->source;
+
+		if (slot->leader != NULL)
+		{
+			slot->format = slot->leader->format;
+			slot->metadata_parts = slot->leader->metadata_parts;
+			slot->metadata_part_count = slot->leader->metadata_part_count;
+		}
+
+		ctx->cur_source = cur_source;
+		ctx->format = slot->format;
+		ctx->metadata_parts = slot->metadata_parts;
+		ctx->metadata_part_count = slot->metadata_part_count;
+
+		rc = ngx_http_vod_parse_metadata(ctx, slot->from_cache);
+
+		if (slot->leader != NULL)
+		{
+			// the leader stored the parts and owns the buffer
+		}
+		else if (slot->from_cache)
+		{
+			if (slot->cache_token != 0)
+			{
+				ngx_buffer_cache_release(
+					conf->metadata_cache,
+					cur_source->file_key,
+					slot->cache_token);
+				slot->cache_token = 0;
+			}
+		}
+		else if (rc == NGX_OK || rc == NGX_AGAIN)
+		{
+			if (conf->metadata_cache != NULL)
+			{
+				multipart_header.type = slot->format->id;
+				multipart_header.part_count = slot->metadata_part_count;
+
+				if (ngx_buffer_cache_store_multipart_perf(
+					ctx,
+					conf->metadata_cache,
+					cur_source->file_key,
+					&multipart_header,
+					slot->metadata_parts))
+				{
+					ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+						"ngx_http_vod_parallel_metadata: stored metadata in cache");
+				}
+				else
+				{
+					ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+						"ngx_http_vod_parallel_metadata: failed to store metadata in cache");
+				}
+			}
+		}
+
+		if (rc == NGX_OK)
+		{
+			continue;
+		}
+
+		if (rc != NGX_AGAIN)
+		{
+			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+				"ngx_http_vod_parallel_metadata: ngx_http_vod_parse_metadata failed %i", rc);
+			ngx_http_vod_metadata_release_tokens(ctx);
+			return rc;
+		}
+
+		// the format wants a frames read for this source - hand it and the
+		// sources after it to the serial loop (the ones already read here are
+		// in the cache by now, so the loop hits on them). this source keeps
+		// its buffer (its parts point into it), every other one is done with
+		ngx_http_vod_metadata_release_tokens(ctx);
+		ngx_http_vod_metadata_free_buffers(ctx, slot->leader != NULL ? slot->leader : slot);
+		ngx_http_vod_metadata_slot_load(ctx, slot);
+		ctx->state = STATE_READ_FRAMES_OPEN_FILE;
+		ctx->metadata_phase = METADATA_PHASE_SERIAL;
+		return NGX_DECLINED;
+	}
+
+	ngx_http_vod_metadata_free_buffers(ctx, NULL);
+
+	ctx->cur_source = NULL;
+	ctx->metadata_phase = METADATA_PHASE_SERIAL;
+	return NGX_OK;
 }
 
 static ngx_int_t
@@ -2433,6 +3089,15 @@ ngx_http_vod_state_machine_parse_metadata(ngx_http_vod_ctx_t *ctx)
 	ngx_int_t rc;
 	uint32_t cache_token;
 	bool_t metadata_loaded;
+
+	if (ctx->metadata_phase != METADATA_PHASE_SERIAL)
+	{
+		rc = ngx_http_vod_parallel_metadata(ctx);
+		if (rc != NGX_DECLINED)
+		{
+			return rc;
+		}
+	}
 
 	if (ctx->cur_source == NULL)
 	{
@@ -2568,7 +3233,7 @@ ngx_http_vod_state_machine_parse_metadata(ngx_http_vod_ctx_t *ctx)
 
 			ngx_perf_counter_start(ctx->perf_counter_context);
 
-			rc = cur_source->reader->read(cur_source->reader_context, &ctx->read_buffer, conf->initial_read_size, 0);
+			rc = ngx_http_vod_issue_metadata_read(ctx, cur_source, conf->initial_read_size, 0);
 			if (rc != NGX_OK)
 			{
 				if (rc != NGX_AGAIN)

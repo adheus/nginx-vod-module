@@ -76,12 +76,17 @@ def _exit():
         _inflight -= 1
 
 
+CB_PREFIX_RE = re.compile(r"^/cb\d+/")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def _resolve(self):
-        # Strip query, normalise, and confine to ROOT.
+        # Strip query, normalise, and confine to ROOT. A leading /cb<N>
+        # component is a cache-busting prefix (see mapping.py) and is dropped.
         path = self.path.split("?", 1)[0]
+        path = CB_PREFIX_RE.sub("/", path, count=1)
         full = os.path.normpath(os.path.join(ROOT, path.lstrip("/")))
         if not full.startswith(os.path.realpath(ROOT)) and not full.startswith(ROOT):
             return None
@@ -114,6 +119,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+
+        # error arm of the parallel-metadata tests: /__err500__/... -> 500
+        if self.path.startswith("/__err500__/") or "/__err500__/" in self.path:
+            self.send_error(500, "synthetic origin failure")
             return
 
         full = self._resolve()

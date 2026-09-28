@@ -224,6 +224,36 @@ MAPPINGS = {
     # Served through /ra/hls/ (read-ahead on) and /ra-serial/hls/ (cap 1).
     "r_sparse_video": seq({"type": "source", "path": "/video_sparse.mp4"}),
 
+    # ---- parallel-metadata-read fixtures (/pm-on/hls/ vs /pm-off/hls/) ----
+    # r_mt_full: the multitrack MP4 over HTTP - a 351 KB moov, larger than the
+    # 256k initial read, so every one of its 7 sources takes the second (moov)
+    # read. r_nofs_*: video_nofs.mp4 is video.mp4 remuxed WITHOUT faststart -
+    # moov after a 42 MB mdat, like the Moises originals - so the reader must
+    # first jump past mdat and then read the moov. r_song_3 warms half the
+    # stems of r_song_full (mixed cache-state test). r_song_full_404 / _500 are
+    # the error arm: five good stems plus one the origin answers 404 / 500 to.
+    "r_mt_full": {
+        "sequences": [
+            {"clips": [{"type": "source", "path": "/multitrack.mp4", "tracks": "v1"}]},
+            {"clips": [{"type": "mixFilter", "sources": [
+                {"type": "source", "path": "/multitrack.mp4", "tracks": f"a{i}"}
+                for i in range(1, 7)]}],
+             "default": True, "label": "Mix", "language": "eng"},
+        ],
+    },
+    "r_nofs_video": seq({"type": "source", "path": "/video_nofs.mp4"}),
+    "r_nofs_muxed": {
+        "sequences": [
+            {"clips": [{"type": "source", "path": "/video_nofs.mp4"}]},
+            {"clips": [mix(*[rstem(n) for n in ALL_STEMS])],
+             "default": True, "label": "Mix", "language": "eng"},
+        ],
+    },
+    "r_song_3": seq(mix(*[rstem(n) for n in ALL_STEMS[:3]])),
+    "r_song_full_404": seq(mix(*[rstem(n) for n in ALL_STEMS[:5]], rstem("missing"))),
+    "r_song_full_500": seq(mix(*[rstem(n) for n in ALL_STEMS[:5]],
+                               {"type": "source", "path": "/__err500__/stems/other.m4a"})),
+
     # production shape: sparse video + 6 remote stems, unmuxed renditions.
     # exercises the FILTER->PROCESS slot hand-off (stem slots become the video
     # read-ahead pool) on top of the video read-ahead itself.
@@ -440,7 +470,30 @@ MAPPINGS = {
 # the /prod/hls/, /prod-nostate/hls/ and /remote/hls/ locations.
 KC_RE = re.compile(r"^(r_)?(kc|kcps)_([sc])(-?\d+)$")
 
+# cb<N>_<key>: the same fixture with every REMOTE source path prefixed /cb<N>
+# (origin_server.py strips it). The module keys its metadata cache on the
+# source URI, so each N is a guaranteed cache miss for every source - the way
+# to measure a cold master without restarting the container.
+CB_RE = re.compile(r"^cb(\d+)_(.+)$")
+
+def _prefix_remote_paths(node, prefix):
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if k == "path" and isinstance(v, str) and not v.startswith(MEDIA_DIR):
+                out[k] = prefix + v
+            else:
+                out[k] = _prefix_remote_paths(v, prefix)
+        return out
+    if isinstance(node, list):
+        return [_prefix_remote_paths(v, prefix) for v in node]
+    return node
+
 def dynamic_mapping(key):
+    m = CB_RE.match(key)
+    if m:
+        inner = MAPPINGS.get(m.group(2)) or dynamic_mapping(m.group(2))
+        return None if inner is None else _prefix_remote_paths(inner, f"/cb{m.group(1)}")
     m = KC_RE.match(key)
     if not m:
         return None
