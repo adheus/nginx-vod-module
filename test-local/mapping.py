@@ -21,6 +21,7 @@ Real song endpoints (One Last Breath - Arrocha Remix, 6 stems):
 """
 
 import json
+import os
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -470,6 +471,13 @@ MAPPINGS = {
 # the /prod/hls/, /prod-nostate/hls/ and /remote/hls/ locations.
 KC_RE = re.compile(r"^(r_)?(kc|kcps)_([sc])(-?\d+)$")
 
+# rt<N>: the production serverTempo shape (moises-stream-server mapping.rs):
+# rateFilter rate=N/100 straight over the 6-stem mix, and the media set states
+# its duration (stem duration / rate) so the module uses its estimate
+# segmenter, like production. r_ prefix = remote reader twin.
+RT_RE = re.compile(r"^(r_)?rt(\d+)$")
+RT_SOURCE_MS = int(os.environ.get("RT_SOURCE_MS", "0"))
+
 # cb<N>_<key>: the same fixture with every REMOTE source path prefixed /cb<N>
 # (origin_server.py strips it). The module keys its metadata cache on the
 # source URI, so each N is a guaranteed cache miss for every source - the way
@@ -494,6 +502,14 @@ def dynamic_mapping(key):
     if m:
         inner = MAPPINGS.get(m.group(2)) or dynamic_mapping(m.group(2))
         return None if inner is None else _prefix_remote_paths(inner, f"/cb{m.group(1)}")
+    m = RT_RE.match(key)
+    if m:
+        mk = rstem if m.group(1) else stem
+        rate = int(m.group(2)) / 100
+        out = seq({"type": "rateFilter", "rate": rate, "source": mix(*[mk(n) for n in ALL_STEMS])})
+        if RT_SOURCE_MS:
+            out["durations"] = [round(RT_SOURCE_MS / rate)]
+        return out
     m = KC_RE.match(key)
     if not m:
         return None

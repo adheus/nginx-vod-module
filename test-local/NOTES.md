@@ -379,3 +379,32 @@ for that run — `pm-off` must show 1, `pm-on` must show min(sources, cap).
 `identical` fetches master + every index playlist + the first 3 segments of
 every rendition on both locations (FFSA blobs wiped before each) and
 compares sha256s.
+
+## rateFilter segment overlap — output frame grid (2026-11-09)
+
+Production defect: with a `rateFilter` (moises-stream-server `serverTempo`) every
+audio segment came out up to one AAC frame LONGER than its slot, overlapping the
+next one: mean −7.7 ms/boundary at 0.71x, −3.0 at 1.5x, −6.5 at 2x (0.5x exact).
+Players that place segments by PTS were fine; Shaka in HLS `sequenceMode` (its
+default on the LG) appends them back to back, so the audio drifted behind the
+video (~100 ms/min). Cause: the sink's keep window is the source window / rate,
+rarely a whole frame, and the sink forwards whole frames (`forwarded` vs `keep`
+in the debug log: 779/174/174 samples over at 0.71x, 512/0 at 2x).
+
+Fix (`audio_filter_grid_init`): every boundary snaps up to the next multiple of
+1024 on the output timeline; a segment drops the head the previous one already
+played (`atrim=start_sample`, counted in samples, so the graph's pts are left
+alone; needs `--enable-filter=atrim`), keeps exactly mark-to-mark and its
+first_frame_time_offset moves by the dropped samples. Only under a rate filter
+with the post-roll trail.
+
+Fixtures: `rt<N>` / `r_rt<N>` = rateFilter rate N/100 over the 6-stem mix (the
+production shape); run the container with `-e RT_SOURCE_MS=163239` so the
+mapping also states `durations` like production.
+
+Results (measure_gaps -n 20, excluding seg1→2): r_rt71/85/150/200 0.00 ms;
+r_kc_s0, r_kc_s1, r_kc_c551, r_rt50: segments byte-identical to the build before.
+Content vs 1x over the whole song, segments appended back to back: before
+−20→+240 ms (0.71x), +130→+320 ms (2x); after flat −40 / +110 ms. The constant
+offset (also with PTS placement: −50 / +70 / +130 ms song time at 0.71/1.5/2x)
+is a separate, unchanged issue.
