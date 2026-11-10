@@ -433,3 +433,20 @@ duration/rate, no wrap, no empty segment, every segment starts on a keyframe,
 first-frame offset constant per stream (0.168 s at 1x, scaled at other rates).
 r_kc_s0, r_kc_s1, r_kc_c551 and vt100 segments byte-identical to the build
 before; measure_gaps r_rt50/71/150/200 0.00 ms/boundary.
+
+## rateFilter over a mixFilter without a stated duration: audio segments 4 s of SOURCE (2026-11-10)
+
+Found right after the sentinel fix above. When the mapping states no
+durations, a segment's range is computed per source in
+`ngx_http_vod_init_parse_params_frames` and converted to source time with the
+rate — but the rate was read only from the source's DIRECT parent. Under
+`rateFilter → mixFilter → source` (the stems) the parent is the mix, the rate
+came out 1, and every audio segment covered 4 s of source (5.64 s of output at
+0.71x) while the playlist listed 4 s: after a seek, Shaka put the audio tens of
+seconds off. Video (source directly under the rate filter) was right. Now every
+rate filter up the parent chain is multiplied in.
+
+Results (no stated duration): audio segments 3.97–4.04 s starting +0.10 s into
+their slot at 0.5/0.71/1.5/2x, exactly like 1x; measure_gaps r_rt* 0.00 ms;
+video unchanged (keyframe-aligned); r_kc_s0, r_kc_s1, r_kc_c551 and vt100
+segments byte-identical to the build before both fixes.

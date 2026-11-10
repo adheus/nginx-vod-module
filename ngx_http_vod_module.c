@@ -1705,6 +1705,7 @@ ngx_http_vod_init_parse_params_frames(
 	media_clip_source_t* cur_source = ctx->cur_source;
 	request_context_t* request_context = &ctx->submodule_context.request_context;
 	segmenter_conf_t* segmenter = ctx->submodule_context.media_set.segmenter_conf;
+	media_clip_t* parent;
 	vod_fraction_t rate;
 	vod_status_t rc;
 	uint64_t last_segment_end;
@@ -1743,15 +1744,21 @@ ngx_http_vod_init_parse_params_frames(
 		return NGX_OK;
 	}
 
-	// get the rate
-	if (cur_source->base.parent != NULL && cur_source->base.parent->type == MEDIA_CLIP_RATE_FILTER)
+	// get the rate: every rate filter ABOVE the source, not only its direct
+	// parent. A rateFilter over a mixFilter (the stems under one speed) has the
+	// mix as each stem's parent; reading only the parent took the rate as 1, so
+	// each audio segment covered segment_duration of SOURCE time (4 s / rate of
+	// output) while the playlist listed it at 4 s. Only reached when the mapping
+	// states no durations (otherwise the range is computed while parsing it).
+	rate.num = 1;
+	rate.denom = 1;
+	for (parent = cur_source->base.parent; parent != NULL; parent = parent->parent)
 	{
-		rate = ((media_clip_rate_filter_t*)cur_source->base.parent)->rate;
-	}
-	else
-	{
-		rate.num = 1;
-		rate.denom = 1;
+		if (parent->type == MEDIA_CLIP_RATE_FILTER)
+		{
+			rate.num *= ((media_clip_rate_filter_t*)parent)->rate.num;
+			rate.denom *= ((media_clip_rate_filter_t*)parent)->rate.denom;
+		}
 	}
 
 	// get the last segment end
