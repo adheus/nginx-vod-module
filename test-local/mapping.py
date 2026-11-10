@@ -476,6 +476,15 @@ KC_RE = re.compile(r"^(r_)?(kc|kcps)_([sc])(-?\d+)$")
 # its duration (stem duration / rate) so the module uses its estimate
 # segmenter, like production. r_ prefix = remote reader twin.
 RT_RE = re.compile(r"^(r_)?rt(\d+)$")
+
+# vt<N>[d] / vo<N>[d]: the production serverTempo shape WITH video — a video
+# sequence (vt: the 4 s-GOP ladder rung renditions/720p.mp4; vo: video.mp4,
+# ~1 s GOP, standing in for an original) and the 6-stem mix, each under the
+# same rateFilter rate N/100, remote reader. "d" also states durations like
+# the server does today (the wrap workaround), which moves the module to its
+# estimate segmenter; without it the module derives the duration itself.
+VT_RE = re.compile(r"^(vt|vo)(\d+)(d?)$")
+VT_SOURCES = {"vt": ("/renditions/720p.mp4", 135900), "vo": ("/video.mp4", 135900)}
 RT_SOURCE_MS = int(os.environ.get("RT_SOURCE_MS", "0"))
 
 # cb<N>_<key>: the same fixture with every REMOTE source path prefixed /cb<N>
@@ -502,6 +511,19 @@ def dynamic_mapping(key):
     if m:
         inner = MAPPINGS.get(m.group(2)) or dynamic_mapping(m.group(2))
         return None if inner is None else _prefix_remote_paths(inner, f"/cb{m.group(1)}")
+    m = VT_RE.match(key)
+    if m:
+        path, src_ms = VT_SOURCES[m.group(1)]
+        rate = int(m.group(2)) / 100
+        def rated(clip):
+            return clip if rate == 1 else {"type": "rateFilter", "rate": rate, "source": clip}
+        out = {"sequences": [
+            {"clips": [rated({"type": "source", "path": path})]},
+            {"clips": [rated(mix(*[rstem(n) for n in ALL_STEMS]))], "default": True, "label": "Mix"},
+        ]}
+        if m.group(3):
+            out["durations"] = [round(src_ms / rate)]
+        return out
     m = RT_RE.match(key)
     if m:
         mk = rstem if m.group(1) else stem

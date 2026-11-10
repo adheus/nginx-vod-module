@@ -408,3 +408,28 @@ Content vs 1x over the whole song, segments appended back to back: before
 −20→+240 ms (0.71x), +130→+320 ms (2x); after flat −40 / +110 ms. The constant
 offset (also with PTS placement: −50 / +70 / +130 ms song time at 0.71/1.5/2x)
 is a separate, unchanged issue.
+
+## rateFilter without a stated duration: last EXTINF wraps (2026-11-10)
+
+`rate_filter_parse` scaled `context->duration` by the rate even when it was
+UINT_MAX — media_set_parser's "no duration stated" sentinel (the source then
+gets clip_to = ULLONG_MAX). The scaled value (~UINT_MAX × rate) became a finite
+clip end; `ngx_http_vod_update_track_timescale` stretched the last frame to it
+and its 32-bit 90 kHz duration wrapped: last EXTINF ~42763 s at 0.71x, 47657 s
+at 2x (2^32/90000 − the rest). Upstream has the same code; it only bites when
+the mapping states neither `durations` nor `clipTo`.
+
+moises-stream-server worked around it by stating `durations`, which moved the
+module to its estimate segmenter: a fixed grid, video segments not starting on
+keyframes, so the playlist's segment times were wrong — Shaka re-anchors there
+after every seek/reload and the picture landed seconds off. With the guard the
+module keyframe-aligns with accurate durations under a rate filter, like 1x.
+
+Fixtures: `vt<N>[d]` (4 s-GOP ladder rung) / `vo<N>[d]` (video.mp4) + the mix,
+same rate on both; `d` = also state durations (the old workaround).
+`scripts`-less check used: every video segment's first frame vs its playlist
+start. Results without `d`: 1x/0.5/0.71/0.85/1.5/2x, both videos — totals equal
+duration/rate, no wrap, no empty segment, every segment starts on a keyframe,
+first-frame offset constant per stream (0.168 s at 1x, scaled at other rates).
+r_kc_s0, r_kc_s1, r_kc_c551 and vt100 segments byte-identical to the build
+before; measure_gaps r_rt50/71/150/200 0.00 ms/boundary.

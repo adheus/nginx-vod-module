@@ -199,7 +199,14 @@ rate_filter_parse(
 
 	old_duration = context->duration;
 	old_clip_from = context->clip_from;
-	context->duration = ((uint64_t)old_duration * filter->rate.num) / filter->rate.denom;
+	// UINT_MAX is "no duration stated" (media_set_parser: the source then gets
+	// clip_to = ULLONG_MAX). Scaling it turns it into a finite clip end of
+	// ~UINT_MAX * rate ms, which the 90 kHz rescale of the last frame wraps into
+	// a negative duration: the playlist's last EXTINF came out as ~47721 s.
+	if (old_duration != UINT_MAX)
+	{
+		context->duration = ((uint64_t)old_duration * filter->rate.num) / filter->rate.denom;
+	}
 	context->clip_from = ((uint64_t)old_clip_from * filter->rate.num) / filter->rate.denom;
 
 	rc = media_set_parse_clip(
