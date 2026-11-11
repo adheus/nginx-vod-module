@@ -77,6 +77,7 @@ RUN cd /tmp/ffmpeg && \
         --enable-filter=aresample \
         --enable-filter=asetrate \
         --enable-filter=atempo \
+        --enable-filter=atrim \
         --enable-filter=volume \
         --enable-filter=amix \
         --enable-filter=aformat \

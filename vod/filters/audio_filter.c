@@ -155,6 +155,17 @@ typedef struct {
 	uint32_t frames_timescale;
 	uint64_t window_duration;		// segment window in output time, frames_timescale units
 
+	// output frame grid (rate-filtered audio only, see audio_filter_grid_init):
+	// the segment window in the SOURCE, and the rate applied to it.
+	// rate_grid: 0 = no rate filter, 1 = one consistent window, 2 = sources disagree
+	uint32_t rate_grid;
+	uint32_t rate_speed_num;
+	uint32_t rate_speed_denom;
+	uint32_t rate_src_timescale;
+	uint32_t rate_src_sample_rate;
+	uint64_t rate_src_start;
+	uint64_t rate_src_end;
+
 #if (VOD_HAVE_LIB_AV_CODEC && VOD_HAVE_LIB_AV_FILTER)
 	// phase 2
 	AVFilterGraph *filter_graph;
@@ -230,6 +241,35 @@ audio_filter_walk_filters_prepare_init(
 			audio_track->media_info.frames_timescale : audio_track->media_info.timescale;
 		window_duration = ((uint64_t)audio_track->total_frames_duration * speed_denom) / speed_num;
 		trail_frame_count = audio_track->frames.next == NULL ? audio_track->trail_frame_count : 0;
+
+		// output frame grid: only under a rate filter, and only when every
+		// source has the same window in the same timescale
+		if (speed_num != speed_denom && state->rate_grid != 2)
+		{
+			if (frames_timescale != audio_track->media_info.timescale)
+			{
+				state->rate_grid = 2;
+			}
+			else if (state->rate_grid == 0)
+			{
+				state->rate_grid = 1;
+				state->rate_speed_num = speed_num;
+				state->rate_speed_denom = speed_denom;
+				state->rate_src_timescale = frames_timescale;
+				state->rate_src_sample_rate = audio_track->media_info.u.audio.sample_rate;
+				state->rate_src_start = audio_track->first_frame_time_offset;
+				state->rate_src_end = audio_track->first_frame_time_offset + audio_track->total_frames_duration;
+			}
+			else if (state->rate_speed_num != speed_num ||
+				state->rate_speed_denom != speed_denom ||
+				state->rate_src_timescale != frames_timescale ||
+				state->rate_src_sample_rate != audio_track->media_info.u.audio.sample_rate ||
+				state->rate_src_start != audio_track->first_frame_time_offset ||
+				state->rate_src_end != audio_track->first_frame_time_offset + audio_track->total_frames_duration)
+			{
+				state->rate_grid = 2;
+			}
+		}
 
 		switch (state->grid_state)
 		{
@@ -388,6 +428,12 @@ typedef struct {
 	uint64_t forwarded_samples;
 	uint64_t dropped_samples;
 	bool_t drained;
+
+	// output frame grid (audio_filter_grid_init): head samples atrim drops
+	// before the sink, and the output samples that offsets the track by
+	uint64_t grid_head_samples;
+	uint32_t grid_sample_rate;
+	bool_t grid_active;
 } audio_filter_state_t;
 
 // globals
@@ -1220,6 +1266,88 @@ audio_filter_capture_decoder_states(
 		"(new total %uz bytes)", new_size);
 }
 
+// Output frame grid for rate-filtered audio.
+//
+// A rate filter maps the segment's source window [S, E) to [S/r, E/r) in the
+// output. The encoder takes whole frames, so the sink rounds the window up to
+// a whole frame; with r != 1 that window is rarely one, and each segment came
+// out up to a frame longer than its slot. The next segment starts where its
+// own source frames say, so consecutive segments overlapped by 0-1 frame
+// (8.5 ms on average at 0.71x): harmless for a player that places segments by
+// their PTS, an accumulating drift for one that appends them back to back.
+//
+// Instead, every boundary snaps up to the next multiple of the frame size on
+// the output timeline: segment k covers [G(S/r), G(E/r)), G(x) = ceil(x/F)*F.
+// G depends only on the boundary, so the next segment computes the same mark
+// for its start and the two meet exactly, on any instance, in any order. The
+// segment drops the G(S/r) - S/r samples of its head the previous segment
+// already played (an atrim before the sink), keeps exactly G(E/r) - G(S/r)
+// samples (whole frames) and its timestamp moves by the dropped samples.
+// The head drop and the timestamp need nothing but the segment's start, so
+// they apply to every segment, the last one included. Keeping exactly up to
+// the next mark needs the post-roll trail (the samples up to G(E/r) lie past
+// E/r): without one (the last segment) the sink forwards what it gets, as
+// before. Only for AAC output (frames of 1024 samples) and when the graph runs
+// at the output sample rate (atrim counts samples at its input). Without a
+// rate filter nothing here runs (1x output is unchanged).
+// Known residue, both bounded and never cumulative (every segment computes its
+// marks from its own boundary): the timestamp is the rate filter's rounded
+// start plus the head, so a boundary can be off by 1 sample; and a segment
+// whose trail is shorter than its last mark (the second to last, at high
+// rates, before a last segment of 1-2 frames) comes out short of it.
+#define AUDIO_FILTER_GRID_FRAME_SIZE (1024)
+#define AUDIO_FILTER_GRID_DESC_SIZE (sizeof(";[]atrim=start_sample=[g]") + 3 * VOD_INT64_LEN)
+
+static uint64_t
+audio_filter_grid_mark(uint64_t src_time, audio_filter_init_context_t* ctx, uint32_t sample_rate)
+{
+	// exact output sample of a source time: src_time / timescale / r * sample_rate,
+	// r = speed_num / speed_denom; floored like the stretched stream's own sample index
+	uint64_t samples = (src_time * ctx->rate_speed_denom * sample_rate) /
+		((uint64_t)ctx->rate_src_timescale * ctx->rate_speed_num);
+	return samples;
+}
+
+static void
+audio_filter_grid_init(
+	request_context_t* request_context,
+	audio_filter_state_t* state,
+	audio_filter_init_context_t* ctx,
+	uint32_t sample_rate,
+	uint32_t output_codec_id,
+	uint64_t* keep_samples)
+{
+	uint64_t start;
+	uint64_t end;
+	uint64_t mark_start;
+	uint64_t mark_end;
+
+	state->grid_active = FALSE;
+	*keep_samples = 0;
+	if (ctx->rate_grid != 1 || output_codec_id == VOD_CODEC_ID_VOLUME_MAP || sample_rate == 0 ||
+		sample_rate != ctx->rate_src_sample_rate || ctx->rate_src_timescale == 0 || ctx->rate_speed_num == 0)
+	{
+		return;
+	}
+
+	start = audio_filter_grid_mark(ctx->rate_src_start, ctx, sample_rate);
+	end = audio_filter_grid_mark(ctx->rate_src_end, ctx, sample_rate);
+	mark_start = ((start + AUDIO_FILTER_GRID_FRAME_SIZE - 1) / AUDIO_FILTER_GRID_FRAME_SIZE) * AUDIO_FILTER_GRID_FRAME_SIZE;
+	mark_end = ((end + AUDIO_FILTER_GRID_FRAME_SIZE - 1) / AUDIO_FILTER_GRID_FRAME_SIZE) * AUDIO_FILTER_GRID_FRAME_SIZE;
+
+	state->grid_active = TRUE;
+	state->grid_head_samples = mark_start - start;
+	state->grid_sample_rate = sample_rate;
+	if (state->post_roll_active && mark_end > mark_start)
+	{
+		*keep_samples = mark_end - mark_start;
+	}
+
+	vod_log_debug4(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+		"audio_filter_grid_init: output %uL-%uL -> grid %uL-%uL",
+		start, end, mark_start, mark_end);
+}
+
 vod_status_t
 audio_filter_alloc_state(
 	request_context_t* request_context,
@@ -1243,6 +1371,7 @@ audio_filter_alloc_state(
 	vod_status_t rc;
 	uint32_t initial_alloc_size;
 	size_t frame_size;
+	uint64_t grid_keep_samples = 0;
 	int avrc;
 
 	// get the source count and graph desc size
@@ -1317,7 +1446,7 @@ audio_filter_alloc_state(
 	}
 
 	// allocate the graph desc and sources
-	init_context.graph_desc = vod_alloc(request_context->pool, init_context.graph_desc_size + 
+	init_context.graph_desc = vod_alloc(request_context->pool, init_context.graph_desc_size + AUDIO_FILTER_GRID_DESC_SIZE +
 		sizeof(state->sources[0]) * init_context.source_count);
 	if (init_context.graph_desc == NULL)
 	{
@@ -1326,7 +1455,7 @@ audio_filter_alloc_state(
 		return VOD_ALLOC_FAILED;
 	}
 
-	state->sources = (void*)(init_context.graph_desc + init_context.graph_desc_size);
+	state->sources = (void*)(init_context.graph_desc + init_context.graph_desc_size + AUDIO_FILTER_GRID_DESC_SIZE);
 	state->sources_end = state->sources + init_context.source_count;
 	vod_memzero(state->sources, (u_char*)state->sources_end - (u_char*)state->sources);
 
@@ -1355,6 +1484,20 @@ audio_filter_alloc_state(
 		audio_decoder_set_trail(&cur_source->decoder, state->trail_frame_count);
 	}
 
+	// output frame grid (rate-filtered audio): drop the head the previous
+	// segment already played, in samples, before the sink chunks into frames.
+	// atrim's start_sample counts samples (not timestamps), so the absolute
+	// pts flowing through the graph are left as they are.
+	vod_sprintf(filter_name, "%uD%Z", clip->id);
+	audio_filter_grid_init(request_context, state, &init_context,
+		output_track->media_info.u.audio.sample_rate, output_codec_id, &grid_keep_samples);
+	if (state->grid_active && state->grid_head_samples > 0)
+	{
+		init_context.graph_desc_pos = vod_sprintf(init_context.graph_desc_pos,
+			";[%uD]atrim=start_sample=%uL[g%uD]%Z", clip->id, state->grid_head_samples, clip->id) - 1;
+		vod_sprintf(filter_name, "g%uD%Z", clip->id);
+	}
+
 	// init the encoder
 	if (output_codec_id == VOD_CODEC_ID_VOLUME_MAP)
 	{
@@ -1365,9 +1508,7 @@ audio_filter_alloc_state(
 		state->sink.encoder = &libav_encoder;
 	}
 
-	// initialize the sink
-	vod_sprintf(filter_name, "%uD%Z", clip->id);
-
+	// initialize the sink (filter_name: the graph's last label, set above)
 	rc = audio_filter_init_sink(
 		request_context,
 		state->filter_graph,
@@ -1423,6 +1564,13 @@ audio_filter_alloc_state(
 	{
 		state->keep_samples = rescale_time(
 			init_context.window_duration, init_context.frames_timescale, sink_link->sample_rate);
+	}
+
+	// output frame grid: the window between the two marks, whole frames (the
+	// sink runs at the output rate, the grid was only set up at that rate)
+	if (grid_keep_samples != 0)
+	{
+		state->keep_samples = grid_keep_samples;
 	}
 
 	vod_log_debug4(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
@@ -1655,6 +1803,13 @@ audio_filter_update_track(audio_filter_state_t* state)
 
 	output->key_frame_count = 0;
 	output->first_frame_time_offset = rescale_time(output->first_frame_time_offset, old_timescale, output->media_info.timescale);
+
+	// output frame grid: the segment starts at its mark, the dropped head later
+	if (state->grid_active && state->grid_head_samples > 0)
+	{
+		output->first_frame_time_offset += rescale_time(
+			state->grid_head_samples, state->grid_sample_rate, output->media_info.timescale);
+	}
 
 	if (output->media_info.codec_name.data != NULL)
 	{

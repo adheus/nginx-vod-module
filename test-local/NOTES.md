@@ -379,3 +379,74 @@ for that run — `pm-off` must show 1, `pm-on` must show min(sources, cap).
 `identical` fetches master + every index playlist + the first 3 segments of
 every rendition on both locations (FFSA blobs wiped before each) and
 compares sha256s.
+
+## rateFilter segment overlap — output frame grid (2026-11-09)
+
+Production defect: with a `rateFilter` (moises-stream-server `serverTempo`) every
+audio segment came out up to one AAC frame LONGER than its slot, overlapping the
+next one: mean −7.7 ms/boundary at 0.71x, −3.0 at 1.5x, −6.5 at 2x (0.5x exact).
+Players that place segments by PTS were fine; Shaka in HLS `sequenceMode` (its
+default on the LG) appends them back to back, so the audio drifted behind the
+video (~100 ms/min). Cause: the sink's keep window is the source window / rate,
+rarely a whole frame, and the sink forwards whole frames (`forwarded` vs `keep`
+in the debug log: 779/174/174 samples over at 0.71x, 512/0 at 2x).
+
+Fix (`audio_filter_grid_init`): every boundary snaps up to the next multiple of
+1024 on the output timeline; a segment drops the head the previous one already
+played (`atrim=start_sample`, counted in samples, so the graph's pts are left
+alone; needs `--enable-filter=atrim`), keeps exactly mark-to-mark and its
+first_frame_time_offset moves by the dropped samples. Only under a rate filter
+with the post-roll trail.
+
+Fixtures: `rt<N>` / `r_rt<N>` = rateFilter rate N/100 over the 6-stem mix (the
+production shape); run the container with `-e RT_SOURCE_MS=163239` so the
+mapping also states `durations` like production.
+
+Results (measure_gaps -n 20, excluding seg1→2): r_rt71/85/150/200 0.00 ms;
+r_kc_s0, r_kc_s1, r_kc_c551, r_rt50: segments byte-identical to the build before.
+Content vs 1x over the whole song, segments appended back to back: before
+−20→+240 ms (0.71x), +130→+320 ms (2x); after flat −40 / +110 ms. The constant
+offset (also with PTS placement: −50 / +70 / +130 ms song time at 0.71/1.5/2x)
+is a separate, unchanged issue.
+
+## rateFilter without a stated duration: last EXTINF wraps (2026-11-10)
+
+`rate_filter_parse` scaled `context->duration` by the rate even when it was
+UINT_MAX — media_set_parser's "no duration stated" sentinel (the source then
+gets clip_to = ULLONG_MAX). The scaled value (~UINT_MAX × rate) became a finite
+clip end; `ngx_http_vod_update_track_timescale` stretched the last frame to it
+and its 32-bit 90 kHz duration wrapped: last EXTINF ~42763 s at 0.71x, 47657 s
+at 2x (2^32/90000 − the rest). Upstream has the same code; it only bites when
+the mapping states neither `durations` nor `clipTo`.
+
+moises-stream-server worked around it by stating `durations`, which moved the
+module to its estimate segmenter: a fixed grid, video segments not starting on
+keyframes, so the playlist's segment times were wrong — Shaka re-anchors there
+after every seek/reload and the picture landed seconds off. With the guard the
+module keyframe-aligns with accurate durations under a rate filter, like 1x.
+
+Fixtures: `vt<N>[d]` (4 s-GOP ladder rung) / `vo<N>[d]` (video.mp4) + the mix,
+same rate on both; `d` = also state durations (the old workaround).
+`scripts`-less check used: every video segment's first frame vs its playlist
+start. Results without `d`: 1x/0.5/0.71/0.85/1.5/2x, both videos — totals equal
+duration/rate, no wrap, no empty segment, every segment starts on a keyframe,
+first-frame offset constant per stream (0.168 s at 1x, scaled at other rates).
+r_kc_s0, r_kc_s1, r_kc_c551 and vt100 segments byte-identical to the build
+before; measure_gaps r_rt50/71/150/200 0.00 ms/boundary.
+
+## rateFilter over a mixFilter without a stated duration: audio segments 4 s of SOURCE (2026-11-10)
+
+Found right after the sentinel fix above. When the mapping states no
+durations, a segment's range is computed per source in
+`ngx_http_vod_init_parse_params_frames` and converted to source time with the
+rate — but the rate was read only from the source's DIRECT parent. Under
+`rateFilter → mixFilter → source` (the stems) the parent is the mix, the rate
+came out 1, and every audio segment covered 4 s of source (5.64 s of output at
+0.71x) while the playlist listed 4 s: after a seek, Shaka put the audio tens of
+seconds off. Video (source directly under the rate filter) was right. Now every
+rate filter up the parent chain is multiplied in.
+
+Results (no stated duration): audio segments 3.97–4.04 s starting +0.10 s into
+their slot at 0.5/0.71/1.5/2x, exactly like 1x; measure_gaps r_rt* 0.00 ms;
+video unchanged (keyframe-aligned); r_kc_s0, r_kc_s1, r_kc_c551 and vt100
+segments byte-identical to the build before both fixes.
