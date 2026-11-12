@@ -229,7 +229,7 @@ MAPPINGS = {
     # r_mt_full: the multitrack MP4 over HTTP - a 351 KB moov, larger than the
     # 256k initial read, so every one of its 7 sources takes the second (moov)
     # read. r_nofs_*: video_nofs.mp4 is video.mp4 remuxed WITHOUT faststart -
-    # moov after a 42 MB mdat, like the Moises originals - so the reader must
+    # moov after a 42 MB mdat, like the production originals - so the reader must
     # first jump past mdat and then read the moov. r_song_3 warms half the
     # stems of r_song_full (mixed cache-state test). r_song_full_404 / _500 are
     # the error arm: five good stems plus one the origin answers 404 / 500 to.
@@ -457,7 +457,7 @@ MAPPINGS = {
 
 # --- parametric keyChange fixtures (segment-boundary frame-loss repro) ------
 # Production wraps the WHOLE 6-stem mix in ONE keyChangeFilter
-# (moises-stream-server src/services/mux-session.ts buildVodMapping: tempo
+# (stream server, src/services/mux-session.ts buildVodMapping: tempo
 # compensation in cents wraps the mix; musical keyShift is applied per stem).
 # These names are resolved on the fly so a measurement run can pick any value
 # without editing this file:
@@ -471,7 +471,7 @@ MAPPINGS = {
 # the /prod/hls/, /prod-nostate/hls/ and /remote/hls/ locations.
 KC_RE = re.compile(r"^(r_)?(kc|kcps)_([sc])(-?\d+)$")
 
-# rt<N>: the production serverTempo shape (moises-stream-server mapping.rs):
+# rt<N>: the production serverTempo shape (stream server mapping.rs):
 # rateFilter rate=N/100 straight over the 6-stem mix, and the media set states
 # its duration (stem duration / rate) so the module uses its estimate
 # segmenter, like production. r_ prefix = remote reader twin.

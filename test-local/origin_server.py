@@ -17,7 +17,7 @@ production topology: nginx-vod-module fetches every source over HTTP via
 The delay is the point
 ----------------------
 Production reads cost 120-735ms each (CDN time-to-first-byte, not bandwidth —
-see docs/segment-latency-investigation.md in moises-stream-server). On loopback
+see docs/segment-latency-investigation.md in the stream server repo). On loopback
 a read costs ~0ms, so a serial pipeline and a concurrent one look identical and
 the win is unmeasurable. ORIGIN_DELAY_MS injects a synthetic TTFB so that:
 

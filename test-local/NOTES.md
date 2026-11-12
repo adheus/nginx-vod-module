@@ -6,7 +6,7 @@ This directory provides an isolated test environment for the nginx-vod-module fo
 
 ```bash
 # Build (always use --no-cache when testing code changes)
-cd /Users/adheus/moises/nginx-vod-module
+cd /path/to/nginx-vod-module
 docker build --no-cache -t vod-test -f test-local/Dockerfile .
 
 # Run
@@ -259,7 +259,7 @@ rebuild. Only changes to `vod/*.c` or the ffmpeg patches need the image.
 ### How to run
 
 ```bash
-cd /Users/adheus/moises/nginx-vod-module
+cd /path/to/nginx-vod-module
 
 # 1. build (ALWAYS --no-cache; ~2.5 min, the ffmpeg build is --disable-everything)
 docker build --no-cache -t vod-test:repro -f test-local/Dockerfile .
@@ -382,7 +382,7 @@ compares sha256s.
 
 ## rateFilter segment overlap — output frame grid (2026-11-09)
 
-Production defect: with a `rateFilter` (moises-stream-server `serverTempo`) every
+Production defect: with a `rateFilter` (the stream server's `serverTempo`) every
 audio segment came out up to one AAC frame LONGER than its slot, overlapping the
 next one: mean −7.7 ms/boundary at 0.71x, −3.0 at 1.5x, −6.5 at 2x (0.5x exact).
 Players that place segments by PTS were fine; Shaka in HLS `sequenceMode` (its
@@ -419,7 +419,7 @@ and its 32-bit 90 kHz duration wrapped: last EXTINF ~42763 s at 0.71x, 47657 s
 at 2x (2^32/90000 − the rest). Upstream has the same code; it only bites when
 the mapping states neither `durations` nor `clipTo`.
 
-moises-stream-server worked around it by stating `durations`, which moved the
+The stream server worked around it by stating `durations`, which moved the
 module to its estimate segmenter: a fixed grid, video segments not starting on
 keyframes, so the playlist's segment times were wrong — Shaka re-anchors there
 after every seek/reload and the picture landed seconds off. With the guard the

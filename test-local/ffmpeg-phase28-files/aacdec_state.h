@@ -6,7 +6,7 @@
  * set_state, emits the same PCM as a continuous decoder would at the
  * same timeline position.
  *
- * For the common AAC-LC case on stem sources (Moises pipeline), the
+ * For the common AAC-LC case on stem sources, the
  * minimal required state is:
  *   - SingleChannelElement.saved[1536]  (IMDCT overlap buffer)
  *   - AACDecContext.is_saved            (overlap valid flag)

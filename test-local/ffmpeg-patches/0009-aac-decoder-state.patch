@@ -1,4 +1,4 @@
-From: stateful-audio <noreply@moises>
+From: stateful-audio <noreply@example.com>
 Date: 2026-04-23
 Subject: [PATCH 0009] libavcodec/aac: AAC decoder state snapshot/restore
 
@@ -18,7 +18,7 @@ native AAC decoder. Adds:
     0x3005 in libavcodec/state_format.h.
 
 Library validation: stateful-aac-validation/test-harness/
-aac_decoder_bit_exact_test passes on all 6 Moises stems (vocals, bass,
+aac_decoder_bit_exact_test passes on all 6 test stems (vocals, bass,
 drums, guitars, piano, other) at chunks ∈ {4, 8, 16, 32, 40} —
 30/30 bit-exact match between a continuous decoder reference and a
 chunked decoder with state transferred at every chunk boundary.

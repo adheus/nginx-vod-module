@@ -135,7 +135,7 @@ static int collect_sce_cb(AACDecContext *ac, SingleChannelElement *sce,
      * context is float. Use ac->is_fixed as the runtime indicator.
      * (In fixed build SingleChannelElement.saved is int, not float.)
      *
-     * For the Moises use case we only ship the float decoder; on the
+     * For our use case we only ship the float decoder; on the
      * fixed decoder we'd need a separate atom — guard below. */
     if (ac->is_fixed) {
         cc->err = AVERROR(ENOSYS);
